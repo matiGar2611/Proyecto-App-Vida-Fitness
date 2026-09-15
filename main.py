@@ -43,7 +43,7 @@ def inicializar_db():
 
     # Migración: si usuarios.db ya existía de una versión anterior sin
     # columnas de rol, se las agregamos ahora (CREATE TABLE IF NOT EXISTS
-    # no modifica una tabla que ya existe, así que hace falta esto aparte).
+    # no modifica una tabla que ya existe).
     cursor.execute("PRAGMA table_info(usuarios)")
     columnas_existentes = {fila[1] for fila in cursor.fetchall()}
     if "rol" not in columnas_existentes:
@@ -188,13 +188,14 @@ def buscar_cliente_por_dni(dni):
     return None
 
 
-def crear_cliente(dni, nombre_y_apellido, telefono, plan):
+def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
     hoy = date.today()
     return {
         "DNI": dni,
         "Nombre y  Apellido": nombre_y_apellido,
         "Telefono": telefono,
         "Plan": plan,
+        "Fecha de nacimiento": fecha_nacimiento,
         "Fecha de inicio": str(hoy),
         "Fecha de vencimiento": str(hoy + timedelta(days=30)),
         "Fecha ultimo pago": str(hoy),
@@ -202,13 +203,14 @@ def crear_cliente(dni, nombre_y_apellido, telefono, plan):
     }
 
 
-def registrar_pago(dni):
+def registrar_pago(dni, nueva_fecha_vencimiento):
+    """A diferencia de antes, la fecha de vencimiento ya no se calcula
+    sola (+30 días) -- se elige a mano en el calendario del diálogo de pago."""
     lista_clientes = cargar_clientes()
     for cliente in lista_clientes:
         if cliente["DNI"] == dni:
-            hoy = date.today()
-            cliente["Fecha ultimo pago"] = str(hoy)
-            cliente["Fecha de vencimiento"] = str(hoy + timedelta(days=30))
+            cliente["Fecha ultimo pago"] = str(date.today())
+            cliente["Fecha de vencimiento"] = nueva_fecha_vencimiento
             cliente["Cliente Activo"] = True
             guardar_clientes(lista_clientes)
             return True
@@ -258,6 +260,8 @@ def obtener_filas(solo_vencidos=False, plan_filtro="Todos"):
             "nombre": cliente["Nombre y  Apellido"],
             "telefono": cliente["Telefono"],
             "plan": cliente["Plan"],
+            "nacimiento": formatear_fecha(cliente["Fecha de nacimiento"])
+                          if cliente.get("Fecha de nacimiento") else "-",
             "vencimiento": formatear_fecha(cliente["Fecha de vencimiento"]),
             "activo": "Sí" if cliente["Cliente Activo"] else "No",
         })
@@ -265,17 +269,17 @@ def obtener_filas(solo_vencidos=False, plan_filtro="Todos"):
 
 
 # ============================================================
-# ESTILOS GLASSMORPHISM
+# ESTILOS GLASSMORPHISM -- gama de verdes
 # ============================================================
 
 CSS = """
 :root {
     --glass-bg: rgba(255, 255, 255, 0.62);
     --glass-border: rgba(255, 255, 255, 0.75);
-    --primary: #6366f1;
-    --secondary: #8b5cf6;
-    --text-primary: #17172b;
-    --shadow: 0 20px 50px rgba(79, 70, 229, 0.10);
+    --primary: #16a34a;
+    --secondary: #22c55e;
+    --text-primary: #10241a;
+    --shadow: 0 20px 50px rgba(21, 128, 61, 0.12);
 }
 
 html, body { min-height: 100%; margin: 0; }
@@ -284,10 +288,10 @@ body {
     font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     color: var(--text-primary);
     background:
-        radial-gradient(circle at 10% 10%, rgba(139, 92, 246, 0.22), transparent 28%),
-        radial-gradient(circle at 90% 15%, rgba(59, 130, 246, 0.18), transparent 25%),
-        radial-gradient(circle at 50% 100%, rgba(99, 102, 241, 0.15), transparent 35%),
-        linear-gradient(135deg, #eef2ff 0%, #f8fafc 45%, #eef2ff 100%);
+        radial-gradient(circle at 10% 10%, rgba(34, 197, 94, 0.22), transparent 28%),
+        radial-gradient(circle at 90% 15%, rgba(16, 185, 129, 0.20), transparent 25%),
+        radial-gradient(circle at 50% 100%, rgba(74, 222, 128, 0.16), transparent 35%),
+        linear-gradient(135deg, #ecfdf5 0%, #f7fefb 45%, #ecfdf5 100%);
     background-attachment: fixed;
 }
 
@@ -297,30 +301,30 @@ body {
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
     border-bottom: 1px solid rgba(255, 255, 255, 0.7);
-    box-shadow: 0 10px 30px rgba(31, 41, 55, 0.06);
+    box-shadow: 0 10px 30px rgba(21, 128, 61, 0.06);
 }
 
 .logo-container { display: flex; align-items: center; gap: 11px; }
 
 .logo-icon {
     width: 40px; height: 40px; border-radius: 13px;
-    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    background: linear-gradient(135deg, #16a34a, #4ade80);
     display: flex; align-items: center; justify-content: center;
-    color: white; box-shadow: 0 10px 25px rgba(99, 102, 241, 0.28);
+    color: white; box-shadow: 0 10px 25px rgba(22, 163, 74, 0.28);
     flex-shrink: 0;
 }
 
-.logo-text { font-size: 19px; font-weight: 800; color: #17172b; letter-spacing: -0.5px; }
+.logo-text { font-size: 19px; font-weight: 800; color: #10241a; letter-spacing: -0.5px; }
 .logo-text span {
-    background: linear-gradient(90deg, #6366f1, #8b5cf6);
+    background: linear-gradient(90deg, #16a34a, #4ade80);
     -webkit-background-clip: text; -webkit-text-fill-color: transparent;
 }
 
-.nav-button { color: #555b73 !important; font-weight: 650; border-radius: 12px; transition: all .2s ease; }
-.nav-button:hover { color: #6366f1 !important; background: rgba(99, 102, 241, 0.08); transform: translateY(-1px); }
+.nav-button { color: #4b5c53 !important; font-weight: 650; border-radius: 12px; transition: all .2s ease; }
+.nav-button:hover { color: #16a34a !important; background: rgba(22, 163, 74, 0.08); transform: translateY(-1px); }
 
-.page-title { font-size: 32px; font-weight: 850; letter-spacing: -1px; color: #17172b; }
-.page-subtitle { color: #6b7280; font-size: 14px; line-height: 1.6; }
+.page-title { font-size: 32px; font-weight: 850; letter-spacing: -1px; color: #10241a; }
+.page-subtitle { color: #5c6b62; font-size: 14px; line-height: 1.6; }
 
 .glass-card {
     background: var(--glass-bg);
@@ -334,37 +338,37 @@ body {
     background: rgba(255, 255, 255, 0.58);
     backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
     border: 1px solid rgba(255, 255, 255, 0.78); border-radius: 20px;
-    padding: 21px; box-shadow: 0 15px 40px rgba(31, 41, 55, 0.07);
+    padding: 21px; box-shadow: 0 15px 40px rgba(21, 128, 61, 0.08);
     transition: all .25s ease;
 }
-.stat-card:hover { transform: translateY(-4px); box-shadow: 0 20px 45px rgba(79, 70, 229, 0.14); }
-.stat-label { color: #737991; font-size: 13px; font-weight: 600; }
-.stat-value { font-size: 31px; font-weight: 850; color: #17172b; margin-top: 5px; }
+.stat-card:hover { transform: translateY(-4px); box-shadow: 0 20px 45px rgba(21, 128, 61, 0.16); }
+.stat-label { color: #5c6b62; font-size: 13px; font-weight: 600; }
+.stat-value { font-size: 31px; font-weight: 850; color: #10241a; margin-top: 5px; }
 
 .table-container {
     background: rgba(255, 255, 255, 0.60);
     backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
     border: 1px solid rgba(255, 255, 255, 0.78); border-radius: 22px;
-    overflow: hidden; box-shadow: 0 20px 50px rgba(31, 41, 55, 0.08);
+    overflow: hidden; box-shadow: 0 20px 50px rgba(21, 128, 61, 0.09);
 }
 
 .q-field--outlined .q-field__control { border-radius: 13px; background: rgba(255, 255, 255, 0.50); }
 .q-btn { border-radius: 12px; font-weight: 650; text-transform: none; }
 .q-btn.bg-primary {
-    background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
-    box-shadow: 0 8px 20px rgba(99, 102, 241, 0.25);
+    background: linear-gradient(135deg, #16a34a, #4ade80) !important;
+    box-shadow: 0 8px 20px rgba(22, 163, 74, 0.28);
 }
 
-.q-table { background: transparent !important; color: #34384d; }
-.q-table thead tr { background: rgba(99, 102, 241, 0.045); }
-.q-table thead th { color: #777d95; font-size: 11px; font-weight: 800; letter-spacing: .7px; }
-.q-table tbody tr:hover { background: rgba(99, 102, 241, 0.055); }
+.q-table { background: transparent !important; color: #26332c; }
+.q-table thead tr { background: rgba(22, 163, 74, 0.05); }
+.q-table thead th { color: #5c6b62; font-size: 11px; font-weight: 800; letter-spacing: .7px; }
+.q-table tbody tr:hover { background: rgba(22, 163, 74, 0.06); }
 
 .q-dialog__inner > .q-card {
     background: rgba(255, 255, 255, 0.85);
     backdrop-filter: blur(25px); -webkit-backdrop-filter: blur(25px);
     border: 1px solid rgba(255, 255, 255, 0.9); border-radius: 24px;
-    box-shadow: 0 30px 80px rgba(31, 41, 55, 0.20);
+    box-shadow: 0 30px 80px rgba(21, 128, 61, 0.20);
 }
 
 .app-footer {
@@ -373,24 +377,24 @@ body {
     background: rgba(255, 255, 255, 0.40);
     backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
 }
-.footer-text { font-size: 12px; color: #85899c; }
+.footer-text { font-size: 12px; color: #6d7c74; }
 
 .login-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
 .login-card {
     background: rgba(255, 255, 255, 0.65);
     backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
     border: 1px solid rgba(255, 255, 255, 0.82); border-radius: 28px;
-    box-shadow: 0 30px 80px rgba(31, 41, 55, 0.15);
+    box-shadow: 0 30px 80px rgba(21, 128, 61, 0.15);
     padding: 40px; width: 420px; max-width: 95vw;
 }
-.login-title { font-size: 26px; font-weight: 850; color: #17172b; text-align: center; letter-spacing: -.5px; }
-.login-subtitle { color: #737991; font-size: 14px; text-align: center; line-height: 1.6; }
+.login-title { font-size: 26px; font-weight: 850; color: #10241a; text-align: center; letter-spacing: -.5px; }
+.login-subtitle { color: #5c6b62; font-size: 14px; text-align: center; line-height: 1.6; }
 .login-hint {
-    background: rgba(99, 102, 241, 0.06); border: 1px solid rgba(99, 102, 241, 0.12);
+    background: rgba(22, 163, 74, 0.07); border: 1px solid rgba(22, 163, 74, 0.14);
     border-radius: 14px; padding: 12px 16px; margin-top: 16px;
 }
-.login-hint-label { color: #6366f1; font-size: 11px; font-weight: 750; text-transform: uppercase; }
-.login-hint-text { color: #6b7280; font-size: 13px; margin-top: 2px; }
+.login-hint-label { color: #16a34a; font-size: 11px; font-weight: 750; text-transform: uppercase; }
+.login-hint-text { color: #5c6b62; font-size: 13px; margin-top: 2px; }
 .login-error {
     background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.18);
     border-radius: 12px; padding: 10px 14px; color: #dc2626; font-size: 13px; font-weight: 600;
@@ -398,22 +402,22 @@ body {
 
 .user-avatar {
     width: 36px; height: 36px; min-width: 36px; border-radius: 12px;
-    background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white;
+    background: linear-gradient(135deg, #16a34a, #4ade80); color: white;
     display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 14px;
 }
-.user-info-name { font-size: 13px; font-weight: 700; color: #25253a; }
-.user-info-role { font-size: 11px; color: #737991; font-weight: 600; text-transform: uppercase; }
+.user-info-name { font-size: 13px; font-weight: 700; color: #1c2e24; }
+.user-info-role { font-size: 11px; color: #5c6b62; font-weight: 600; text-transform: uppercase; }
 
 .mi-cuenta-card {
     background: rgba(255, 255, 255, 0.65);
     backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
     border: 1px solid rgba(255, 255, 255, 0.8); border-radius: 24px;
-    box-shadow: 0 25px 60px rgba(31, 41, 55, 0.12);
+    box-shadow: 0 25px 60px rgba(21, 128, 61, 0.14);
     padding: 32px; width: 480px; max-width: 95vw;
 }
 .dato-fila { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(0,0,0,0.06); }
-.dato-label { color: #737991; font-weight: 600; }
-.dato-valor { color: #17172b; font-weight: 700; }
+.dato-label { color: #5c6b62; font-weight: 600; }
+.dato-valor { color: #10241a; font-weight: 700; }
 """
 
 
@@ -547,6 +551,9 @@ def abrir_formulario_cliente(al_guardar):
                 value='2 veces por semana', label='Plan'
             ).props('outlined').classes('w-full')
 
+            ui.label('Fecha de nacimiento').classes('text-sm text-gray-600 mt-2')
+            nacimiento = ui.date().props('outlined').classes('w-full')
+
             with ui.row().classes('w-full justify-end gap-2 mt-5'):
                 ui.button('Cancelar', on_click=dialog.close).props('flat')
 
@@ -557,6 +564,9 @@ def abrir_formulario_cliente(al_guardar):
                     if len(telefono.value.strip()) != 10:
                         ui.notify('El teléfono debe tener 10 caracteres.', type='negative')
                         return
+                    if not nacimiento.value:
+                        ui.notify('Elegí la fecha de nacimiento.', type='negative')
+                        return
                     if dni_existe(cargar_clientes(), dni.value.strip()):
                         ui.notify('Este DNI ya está registrado.', type='negative')
                         return
@@ -564,7 +574,7 @@ def abrir_formulario_cliente(al_guardar):
                     lista_clientes = cargar_clientes()
                     lista_clientes.append(
                         crear_cliente(dni.value.strip(), nombre.value.strip(),
-                                      telefono.value.strip(), plan.value)
+                                      telefono.value.strip(), plan.value, nacimiento.value)
                     )
                     guardar_clientes(lista_clientes)
                     ui.notify('Cliente agregado correctamente.', type='positive')
@@ -572,6 +582,36 @@ def abrir_formulario_cliente(al_guardar):
                     al_guardar()
 
                 ui.button('Guardar', icon='save', on_click=guardar).props('unelevated color=primary')
+
+    dialog.open()
+
+
+def abrir_dialogo_pago(dni, nombre, al_registrar):
+    """Al registrar un pago, se elige con un calendario hasta cuándo
+    queda pagada la cuota (en vez de calcularlo solo con +30 días)."""
+    with ui.dialog() as dialog:
+        with ui.card().classes('w-[400px] max-w-[95vw] p-7'):
+            ui.label('Registrar pago').classes('text-xl font-bold')
+            ui.label(f'Cliente: {nombre}').classes('text-gray-600 mb-3')
+
+            sugerencia = str(date.today() + timedelta(days=30))
+            ui.label('Cuota paga hasta:').classes('text-sm text-gray-600')
+            calendario = ui.date(value=sugerencia).props('outlined')
+
+            with ui.row().classes('w-full justify-end gap-2 mt-5'):
+                ui.button('Cancelar', on_click=dialog.close).props('flat')
+
+                def confirmar():
+                    if not calendario.value:
+                        ui.notify('Elegí una fecha en el calendario.', type='negative')
+                        return
+                    registrar_pago(dni, calendario.value)
+                    ui.notify('Pago registrado, vencimiento actualizado.', type='positive')
+                    dialog.close()
+                    al_registrar()
+
+                ui.button('Confirmar pago', icon='payments', on_click=confirmar) \
+                    .props('unelevated color=primary')
 
     dialog.open()
 
@@ -619,7 +659,6 @@ def pagina_principal():
                 with ui.column().classes('gap-0'):
                     ui.label('Clientes').classes('page-title')
                     ui.label('Gestioná los socios del gimnasio.').classes('page-subtitle')
-                # Agregar cliente: dueño y profe pueden
                 ui.button('Nuevo cliente', icon='add',
                           on_click=lambda: abrir_formulario_cliente(refrescar)) \
                     .props('unelevated color=primary').classes('px-5')
@@ -647,6 +686,7 @@ def pagina_principal():
                     {'name': 'nombre', 'label': 'Nombre y Apellido', 'field': 'nombre', 'align': 'left'},
                     {'name': 'telefono', 'label': 'Teléfono', 'field': 'telefono', 'align': 'left'},
                     {'name': 'plan', 'label': 'Plan', 'field': 'plan', 'align': 'left'},
+                    {'name': 'nacimiento', 'label': 'Cumpleaños', 'field': 'nacimiento', 'align': 'left'},
                     {'name': 'vencimiento', 'label': 'Vencimiento', 'field': 'vencimiento', 'align': 'left'},
                     {'name': 'activo', 'label': 'Activo', 'field': 'activo', 'align': 'left'},
                     {'name': 'acciones', 'label': '', 'field': 'acciones', 'align': 'right'},
@@ -654,8 +694,7 @@ def pagina_principal():
 
                 tabla = ui.table(columns=columnas, rows=[], row_key='dni').classes('w-full')
 
-                # El botón de eliminar solo se dibuja para el dueño -- los
-                # profes pueden registrar pagos, pero no dar de baja clientes.
+                # El botón de eliminar solo se dibuja para el dueño.
                 boton_eliminar_html = '''
                         <q-btn flat round dense icon="delete" color="negative"
                                @click="$parent.$emit('eliminar', props.row)">
@@ -674,11 +713,7 @@ def pagina_principal():
                 ''')
 
                 def on_pagar(e):
-                    if registrar_pago(e.args['dni']):
-                        ui.notify('Pago registrado, vencimiento renovado.', type='positive')
-                    else:
-                        ui.notify('No se encontró el cliente.', type='negative')
-                    refrescar()
+                    abrir_dialogo_pago(e.args['dni'], e.args['nombre'], refrescar)
 
                 def on_eliminar(e):
                     if not es_dueño():
@@ -739,6 +774,9 @@ def pagina_mi_cuenta():
                     ('DNI', cliente['DNI']),
                     ('Teléfono', cliente['Telefono']),
                     ('Plan', cliente['Plan']),
+                    ('Fecha de nacimiento',
+                        formatear_fecha(cliente['Fecha de nacimiento'])
+                        if cliente.get('Fecha de nacimiento') else '-'),
                     ('Fecha de inicio', formatear_fecha(cliente['Fecha de inicio'])),
                     ('Fecha de vencimiento', formatear_fecha(cliente['Fecha de vencimiento'])),
                     ('Último pago', formatear_fecha(cliente['Fecha ultimo pago'])),
@@ -768,7 +806,6 @@ def abrir_formulario_usuario(al_guardar):
                 .props('outlined').classes('w-full')
             rol = ui.select(ROLES, value='profe', label='Rol').props('outlined').classes('w-full')
 
-            # Solo aparece si el rol elegido es "cliente": a qué DNI se lo vincula
             select_dni = ui.select({}, label='Vincular a socio (DNI)').props('outlined').classes('w-full')
             select_dni.visible = False
 
@@ -883,13 +920,15 @@ def pagina_usuarios():
 
 inicializar_db()
 
+# Un solo ui.run(): si está la variable de entorno PORT (típico en
+# servicios de hosting como Render/Railway) se usa esa, si no, 8080.
 ui.run(
     title='Gimnasio Vida Fitness',
     favicon='🏋️',
     reload=False,
     storage_secret='gimnasio_vida_fitness_secret',
+    ),
 )
-
 ui.run(
     host='0.0.0.0',
     port=int(os.environ.get('PORT', 8080)),

@@ -1,0 +1,13 @@
+[
+    {
+        "DNI": "34756145",
+        "Nombre y  Apellido": "Matias Garcia",
+        "Telefono": "2634847749",
+        "Plan": "3 veces por semana",
+        "Fecha de nacimiento": "1989-11-26",
+        "Fecha de inicio": "2026-09-14",
+        "Fecha de vencimiento": "2026-10-14",
+        "Fecha ultimo pago": "2026-09-14",
+        "Cliente Activo": true
+    }
+]

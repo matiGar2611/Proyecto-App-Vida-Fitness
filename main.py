@@ -14,7 +14,7 @@ from datetime import date, timedelta, datetime
 DB_USUARIOS = 'usuarios.db'
 ARCHIVO_CLIENTES = 'Clientes.json'
 
-ROLES = ['dueño', 'profe', 'cliente']
+ROLES = ['dueño', 'profe']
 
 
 # ============================================================
@@ -35,21 +35,16 @@ def inicializar_db():
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             nombre TEXT NOT NULL,
-            rol TEXT NOT NULL,
-            dni_asociado TEXT
+            rol TEXT NOT NULL
         )
     """)
     conn.commit()
 
-    # Migración: si usuarios.db ya existía de una versión anterior sin
-    # columnas de rol, se las agregamos ahora (CREATE TABLE IF NOT EXISTS
-    # no modifica una tabla que ya existe).
+    # Migración: agrega columnas si venían de una versión anterior.
     cursor.execute("PRAGMA table_info(usuarios)")
     columnas_existentes = {fila[1] for fila in cursor.fetchall()}
     if "rol" not in columnas_existentes:
         cursor.execute("ALTER TABLE usuarios ADD COLUMN rol TEXT NOT NULL DEFAULT 'dueño'")
-    if "dni_asociado" not in columnas_existentes:
-        cursor.execute("ALTER TABLE usuarios ADD COLUMN dni_asociado TEXT")
     conn.commit()
     conn.close()
     crear_usuario_dueño()
@@ -68,16 +63,14 @@ def verificar_password(password, salt, hash_val):
 
 
 def crear_usuario_dueño():
-    """El primer usuario que existe siempre es el dueño, con permisos totales."""
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM usuarios")
     if cursor.fetchone()[0] == 0:
         salt, hash_val = hash_password('admin123')
         cursor.execute(
-            "INSERT INTO usuarios (username, password_hash, salt, nombre, rol, dni_asociado) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ('admin', hash_val, salt, 'Dueño del gimnasio', 'dueño', None)
+            "INSERT INTO usuarios (username, password_hash, salt, nombre, rol) VALUES (?, ?, ?, ?, ?)",
+            ('admin', hash_val, salt, 'Dueño del gimnasio', 'dueño')
         )
         conn.commit()
     conn.close()
@@ -87,9 +80,20 @@ def obtener_usuario(username):
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, username, password_hash, salt, nombre, rol, dni_asociado "
-        "FROM usuarios WHERE username = ?",
+        "SELECT id, username, password_hash, salt, nombre, rol FROM usuarios WHERE username = ?",
         (username,)
+    )
+    usuario = cursor.fetchone()
+    conn.close()
+    return usuario
+
+
+def obtener_usuario_por_id(user_id):
+    conn = conectar_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, username, password_hash, salt, nombre, rol FROM usuarios WHERE id = ?",
+        (user_id,)
     )
     usuario = cursor.fetchone()
     conn.close()
@@ -99,21 +103,38 @@ def obtener_usuario(username):
 def obtener_todos_usuarios():
     conn = conectar_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, username, nombre, rol, dni_asociado FROM usuarios ORDER BY rol, nombre")
+    cursor.execute("SELECT id, username, nombre, rol FROM usuarios ORDER BY rol, nombre")
     usuarios = cursor.fetchall()
     conn.close()
     return usuarios
 
 
-def crear_usuario(username, password, nombre, rol, dni_asociado=None):
+def crear_usuario(username, password, nombre, rol):
     conn = conectar_db()
     cursor = conn.cursor()
     salt, hash_val = hash_password(password)
     cursor.execute(
-        "INSERT INTO usuarios (username, password_hash, salt, nombre, rol, dni_asociado) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (username, hash_val, salt, nombre, rol, dni_asociado)
+        "INSERT INTO usuarios (username, password_hash, salt, nombre, rol) VALUES (?, ?, ?, ?, ?)",
+        (username, hash_val, salt, nombre, rol)
     )
+    conn.commit()
+    conn.close()
+
+
+def actualizar_usuario(user_id, username, nombre, rol, nueva_password=None):
+    conn = conectar_db()
+    cursor = conn.cursor()
+    if nueva_password:
+        salt, hash_val = hash_password(nueva_password)
+        cursor.execute(
+            "UPDATE usuarios SET username = ?, nombre = ?, rol = ?, password_hash = ?, salt = ? WHERE id = ?",
+            (username, nombre, rol, hash_val, salt, user_id)
+        )
+    else:
+        cursor.execute(
+            "UPDATE usuarios SET username = ?, nombre = ?, rol = ? WHERE id = ?",
+            (username, nombre, rol, user_id)
+        )
     conn.commit()
     conn.close()
 
@@ -138,14 +159,6 @@ def rol_actual():
 
 def es_dueño():
     return rol_actual() == 'dueño'
-
-
-def es_profe():
-    return rol_actual() == 'profe'
-
-
-def es_cliente_rol():
-    return rol_actual() == 'cliente'
 
 
 def requerir_autenticacion():
@@ -203,9 +216,20 @@ def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
     }
 
 
+def actualizar_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
+    lista_clientes = cargar_clientes()
+    for cliente in lista_clientes:
+        if cliente["DNI"] == dni:
+            cliente["Nombre y  Apellido"] = nombre_y_apellido
+            cliente["Telefono"] = telefono
+            cliente["Plan"] = plan
+            cliente["Fecha de nacimiento"] = fecha_nacimiento
+            guardar_clientes(lista_clientes)
+            return True
+    return False
+
+
 def registrar_pago(dni, nueva_fecha_vencimiento):
-    """A diferencia de antes, la fecha de vencimiento ya no se calcula
-    sola (+30 días) -- se elige a mano en el calendario del diálogo de pago."""
     lista_clientes = cargar_clientes()
     for cliente in lista_clientes:
         if cliente["DNI"] == dni:
@@ -266,6 +290,47 @@ def obtener_filas(solo_vencidos=False, plan_filtro="Todos"):
             "activo": "Sí" if cliente["Cliente Activo"] else "No",
         })
     return filas
+
+
+def proximos_cumpleanos(dias_rango=30):
+    """Para cada cliente con fecha de nacimiento, calcula cuántos días
+    faltan para su PRÓXIMO cumpleaños (comparando solo mes y día, sin
+    importar en qué año nació), y devuelve los que caen dentro del
+    rango, ordenados del más próximo al más lejano."""
+    hoy = date.today()
+    resultados = []
+
+    for cliente in cargar_clientes():
+        fecha_nac_texto = cliente.get("Fecha de nacimiento")
+        if not fecha_nac_texto:
+            continue
+
+        fecha_nac = datetime.strptime(fecha_nac_texto, "%Y-%m-%d").date()
+
+        try:
+            proximo = fecha_nac.replace(year=hoy.year)
+        except ValueError:
+            # 29 de febrero en un año que no es bisiesto
+            proximo = fecha_nac.replace(year=hoy.year, day=28)
+
+        if proximo < hoy:
+            try:
+                proximo = proximo.replace(year=hoy.year + 1)
+            except ValueError:
+                proximo = proximo.replace(year=hoy.year + 1, day=28)
+
+        dias_faltantes = (proximo - hoy).days
+        if dias_faltantes <= dias_rango:
+            resultados.append({
+                "nombre": cliente["Nombre y  Apellido"],
+                "dni": cliente["DNI"],
+                "fecha": proximo.strftime("%d/%m"),
+                "dias_faltantes": dias_faltantes,
+                "es_hoy": dias_faltantes == 0,
+            })
+
+    resultados.sort(key=lambda r: r["dias_faltantes"])
+    return resultados
 
 
 # ============================================================
@@ -408,16 +473,18 @@ body {
 .user-info-name { font-size: 13px; font-weight: 700; color: #1c2e24; }
 .user-info-role { font-size: 11px; color: #5c6b62; font-weight: 600; text-transform: uppercase; }
 
-.mi-cuenta-card {
-    background: rgba(255, 255, 255, 0.65);
-    backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
-    border: 1px solid rgba(255, 255, 255, 0.8); border-radius: 24px;
-    box-shadow: 0 25px 60px rgba(21, 128, 61, 0.14);
-    padding: 32px; width: 480px; max-width: 95vw;
+.cumple-fila {
+    padding: 10px 14px; border-radius: 12px;
+    background: rgba(255, 255, 255, 0.45);
+    margin-bottom: 6px;
 }
-.dato-fila { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(0,0,0,0.06); }
-.dato-label { color: #5c6b62; font-weight: 600; }
-.dato-valor { color: #10241a; font-weight: 700; }
+.cumple-hoy {
+    padding: 10px 14px; border-radius: 12px;
+    background: linear-gradient(135deg, rgba(74, 222, 128, 0.35), rgba(250, 204, 21, 0.30));
+    border: 1px solid rgba(22, 163, 74, 0.4);
+    margin-bottom: 6px;
+    font-weight: 700;
+}
 """
 
 
@@ -436,16 +503,11 @@ def construir_navbar():
 
             ui.space()
 
-            if es_dueño() or es_profe():
-                ui.button('Clientes', icon='groups', on_click=lambda: ui.navigate.to('/')) \
-                    .props('flat').classes('nav-button')
+            ui.button('Clientes', icon='groups', on_click=lambda: ui.navigate.to('/')) \
+                .props('flat').classes('nav-button')
 
             if es_dueño():
                 ui.button('Usuarios', icon='manage_accounts', on_click=lambda: ui.navigate.to('/usuarios')) \
-                    .props('flat').classes('nav-button')
-
-            if es_cliente_rol():
-                ui.button('Mi cuenta', icon='person', on_click=lambda: ui.navigate.to('/mi-cuenta')) \
                     .props('flat').classes('nav-button')
 
             ui.separator().props('vertical').classes('mx-2').style('height: 28px;')
@@ -473,7 +535,7 @@ def construir_footer():
 @ui.page('/login')
 def pagina_login():
     if verificar_autenticacion():
-        ui.navigate.to('/mi-cuenta' if es_cliente_rol() else '/')
+        ui.navigate.to('/')
         return
 
     ui.add_head_html(f'<style>{CSS}</style>')
@@ -518,10 +580,9 @@ def pagina_login():
                 app.storage.user['username'] = registro[1]
                 app.storage.user['nombre'] = registro[4]
                 app.storage.user['rol'] = registro[5]
-                app.storage.user['dni_asociado'] = registro[6]
 
                 ui.notify(f'Bienvenido, {registro[4]}', type='positive')
-                ui.navigate.to('/mi-cuenta' if registro[5] == 'cliente' else '/')
+                ui.navigate.to('/')
 
             ui.button('Ingresar', icon='login', on_click=intentar_login) \
                 .props('unelevated color=primary').classes('w-full mt-2')
@@ -535,7 +596,7 @@ def pagina_login():
 
 
 # ============================================================
-# DIÁLOGOS: cliente
+# DIÁLOGOS: cliente (agregar / editar / pagar / eliminar)
 # ============================================================
 
 def abrir_formulario_cliente(al_guardar):
@@ -586,9 +647,52 @@ def abrir_formulario_cliente(al_guardar):
     dialog.open()
 
 
+def abrir_formulario_editar_cliente(dni_original, al_guardar):
+    cliente = buscar_cliente_por_dni(dni_original)
+    if cliente is None:
+        ui.notify('No se encontró el cliente.', type='negative')
+        return
+
+    with ui.dialog() as dialog:
+        with ui.card().classes('w-[480px] max-w-[95vw] p-7'):
+            ui.label('Editar cliente').classes('text-2xl font-bold')
+            ui.label(f'DNI: {dni_original} (no editable)').classes('text-sm text-gray-500 mb-2')
+
+            nombre = ui.input('Nombre y Apellido', value=cliente['Nombre y  Apellido']) \
+                .props('outlined').classes('w-full')
+            telefono = ui.input('Teléfono (10 caracteres)', value=cliente['Telefono']) \
+                .props('outlined').classes('w-full')
+            plan = ui.select(
+                ['2 veces por semana', '3 veces por semana', 'Todos los días'],
+                value=cliente['Plan'], label='Plan'
+            ).props('outlined').classes('w-full')
+
+            ui.label('Fecha de nacimiento').classes('text-sm text-gray-600 mt-2')
+            nacimiento = ui.date(value=cliente.get('Fecha de nacimiento')).props('outlined').classes('w-full')
+
+            with ui.row().classes('w-full justify-end gap-2 mt-5'):
+                ui.button('Cancelar', on_click=dialog.close).props('flat')
+
+                def guardar():
+                    if len(telefono.value.strip()) != 10:
+                        ui.notify('El teléfono debe tener 10 caracteres.', type='negative')
+                        return
+                    if not nacimiento.value:
+                        ui.notify('Elegí la fecha de nacimiento.', type='negative')
+                        return
+
+                    actualizar_cliente(dni_original, nombre.value.strip(),
+                                       telefono.value.strip(), plan.value, nacimiento.value)
+                    ui.notify('Cliente actualizado.', type='positive')
+                    dialog.close()
+                    al_guardar()
+
+                ui.button('Guardar cambios', icon='save', on_click=guardar).props('unelevated color=primary')
+
+    dialog.open()
+
+
 def abrir_dialogo_pago(dni, nombre, al_registrar):
-    """Al registrar un pago, se elige con un calendario hasta cuándo
-    queda pagada la cuota (en vez de calcularlo solo con +30 días)."""
     with ui.dialog() as dialog:
         with ui.card().classes('w-[400px] max-w-[95vw] p-7'):
             ui.label('Registrar pago').classes('text-xl font-bold')
@@ -636,16 +740,12 @@ def confirmar_eliminacion(dni, nombre, al_eliminar):
 
 
 # ============================================================
-# PÁGINA PRINCIPAL (dueño y profe)
+# PÁGINA PRINCIPAL
 # ============================================================
 
 @ui.page('/')
 def pagina_principal():
     if not requerir_autenticacion():
-        return
-
-    if es_cliente_rol():
-        ui.navigate.to('/mi-cuenta')
         return
 
     dar_baja_automatica()
@@ -671,6 +771,12 @@ def pagina_principal():
                     ui.label('Cuotas vencidas').classes('stat-label')
                     etiqueta_vencidos = ui.label('0').classes('stat-value')
 
+            # ---- Panel de cumpleaños: siempre visible, se recalcula
+            # cada vez que se agrega/edita/paga un cliente ----
+            with ui.column().classes('glass-card w-full p-5'):
+                ui.label('🎂 Próximos cumpleaños (30 días)').classes('text-lg font-bold mb-2')
+                contenedor_cumples = ui.column().classes('w-full')
+
             with ui.column().classes('table-container w-full p-4 gap-3'):
                 with ui.row().classes('items-center gap-3'):
                     checkbox_vencidos = ui.checkbox('Solo vencidos')
@@ -694,7 +800,6 @@ def pagina_principal():
 
                 tabla = ui.table(columns=columnas, rows=[], row_key='dni').classes('w-full')
 
-                # El botón de eliminar solo se dibuja para el dueño.
                 boton_eliminar_html = '''
                         <q-btn flat round dense icon="delete" color="negative"
                                @click="$parent.$emit('eliminar', props.row)">
@@ -704,6 +809,10 @@ def pagina_principal():
 
                 tabla.add_slot('body-cell-acciones', f'''
                     <q-td :props="props">
+                        <q-btn flat round dense icon="edit" color="primary"
+                               @click="$parent.$emit('editar', props.row)">
+                            <q-tooltip>Editar</q-tooltip>
+                        </q-btn>
                         <q-btn flat round dense icon="payments" color="primary"
                                @click="$parent.$emit('pagar', props.row)">
                             <q-tooltip>Registrar pago</q-tooltip>
@@ -711,6 +820,9 @@ def pagina_principal():
                         {boton_eliminar_html}
                     </q-td>
                 ''')
+
+                def on_editar(e):
+                    abrir_formulario_editar_cliente(e.args['dni'], refrescar)
 
                 def on_pagar(e):
                     abrir_dialogo_pago(e.args['dni'], e.args['nombre'], refrescar)
@@ -721,6 +833,7 @@ def pagina_principal():
                         return
                     confirmar_eliminacion(e.args['dni'], e.args['nombre'], refrescar)
 
+                tabla.on('editar', on_editar)
                 tabla.on('pagar', on_pagar)
                 tabla.on('eliminar', on_eliminar)
 
@@ -733,6 +846,21 @@ def pagina_principal():
                 etiqueta_activos.set_text(str(sum(1 for c in lista_clientes if c["Cliente Activo"])))
                 etiqueta_vencidos.set_text(str(sum(1 for c in lista_clientes if esta_vencido(c))))
 
+                contenedor_cumples.clear()
+                with contenedor_cumples:
+                    cumples = proximos_cumpleanos(30)
+                    if not cumples:
+                        ui.label('No hay cumpleaños en los próximos 30 días.').classes('text-gray-500')
+                    else:
+                        for c in cumples:
+                            clase = 'cumple-hoy' if c['es_hoy'] else 'cumple-fila'
+                            with ui.row().classes(f'{clase} w-full items-center justify-between'):
+                                ui.label(f"{c['nombre']} ({c['dni']})")
+                                if c['es_hoy']:
+                                    ui.label('🎉 ¡Hoy!')
+                                else:
+                                    ui.label(f"{c['fecha']} · en {c['dias_faltantes']} días")
+
             checkbox_vencidos.on_value_change(refrescar)
             select_plan.on_value_change(refrescar)
 
@@ -742,57 +870,7 @@ def pagina_principal():
 
 
 # ============================================================
-# PÁGINA: MI CUENTA (solo rol cliente)
-# ============================================================
-
-@ui.page('/mi-cuenta')
-def pagina_mi_cuenta():
-    if not requerir_autenticacion():
-        return
-
-    if not es_cliente_rol():
-        ui.navigate.to('/')
-        return
-
-    ui.add_head_html(f'<style>{CSS}</style>')
-    construir_navbar()
-
-    dni_asociado = app.storage.user.get('dni_asociado')
-    cliente = buscar_cliente_por_dni(dni_asociado) if dni_asociado else None
-
-    with ui.column().classes('w-full min-h-screen items-center justify-center'):
-        with ui.element('div').classes('mi-cuenta-card'):
-            ui.label('Mi situación en el gimnasio').classes('page-title')
-            ui.label('Datos de tu plan y tu cuota.').classes('page-subtitle mb-4')
-
-            if cliente is None:
-                ui.label('Tu usuario todavía no está vinculado a una ficha de socio. '
-                         'Consultá con recepción.').classes('login-error w-full mt-4')
-            else:
-                datos = [
-                    ('Nombre y Apellido', cliente['Nombre y  Apellido']),
-                    ('DNI', cliente['DNI']),
-                    ('Teléfono', cliente['Telefono']),
-                    ('Plan', cliente['Plan']),
-                    ('Fecha de nacimiento',
-                        formatear_fecha(cliente['Fecha de nacimiento'])
-                        if cliente.get('Fecha de nacimiento') else '-'),
-                    ('Fecha de inicio', formatear_fecha(cliente['Fecha de inicio'])),
-                    ('Fecha de vencimiento', formatear_fecha(cliente['Fecha de vencimiento'])),
-                    ('Último pago', formatear_fecha(cliente['Fecha ultimo pago'])),
-                    ('Estado', 'Activo' if cliente['Cliente Activo'] else 'Inactivo'),
-                    ('Cuota', 'Vencida' if esta_vencido(cliente) else 'Al día'),
-                ]
-                for etiqueta, valor in datos:
-                    with ui.row().classes('dato-fila w-full'):
-                        ui.label(etiqueta).classes('dato-label')
-                        ui.label(str(valor)).classes('dato-valor')
-
-        construir_footer()
-
-
-# ============================================================
-# PÁGINA: USUARIOS (solo dueño)
+# PÁGINA: USUARIOS (solo dueño) -- crear y editar
 # ============================================================
 
 def abrir_formulario_usuario(al_guardar):
@@ -805,22 +883,6 @@ def abrir_formulario_usuario(al_guardar):
             password = ui.input('Contraseña', password=True, password_toggle_button=True) \
                 .props('outlined').classes('w-full')
             rol = ui.select(ROLES, value='profe', label='Rol').props('outlined').classes('w-full')
-
-            select_dni = ui.select({}, label='Vincular a socio (DNI)').props('outlined').classes('w-full')
-            select_dni.visible = False
-
-            def actualizar_campo_dni():
-                if rol.value == 'cliente':
-                    opciones_dni = {c['DNI']: f"{c['DNI']} - {c['Nombre y  Apellido']}"
-                                    for c in cargar_clientes()}
-                    select_dni.options = opciones_dni
-                    select_dni.update()
-                    select_dni.visible = True
-                else:
-                    select_dni.visible = False
-
-            rol.on_value_change(actualizar_campo_dni)
-            actualizar_campo_dni()
 
             with ui.row().classes('w-full justify-end gap-2 mt-5'):
                 ui.button('Cancelar', on_click=dialog.close).props('flat')
@@ -835,19 +897,61 @@ def abrir_formulario_usuario(al_guardar):
                     if obtener_usuario(username.value.strip()):
                         ui.notify('Ese nombre de usuario ya existe.', type='negative')
                         return
-                    dni_asociado = select_dni.value if rol.value == 'cliente' else None
-                    if rol.value == 'cliente' and not dni_asociado:
-                        ui.notify('Elegí a qué socio se vincula esta cuenta.', type='negative')
-                        return
 
-                    crear_usuario(username.value.strip(), password.value, nombre.value.strip(),
-                                  rol.value, dni_asociado)
+                    crear_usuario(username.value.strip(), password.value, nombre.value.strip(), rol.value)
                     ui.notify('Usuario creado correctamente.', type='positive')
                     dialog.close()
                     al_guardar()
 
                 ui.button('Crear usuario', icon='person_add', on_click=guardar) \
                     .props('unelevated color=primary')
+
+    dialog.open()
+
+
+def abrir_formulario_editar_usuario(user_id, al_guardar):
+    usuario = obtener_usuario_por_id(user_id)
+    if usuario is None:
+        ui.notify('No se encontró el usuario.', type='negative')
+        return
+    _, username_actual, _, _, nombre_actual, rol_actual_valor = usuario
+
+    with ui.dialog() as dialog:
+        with ui.card().classes('w-[480px] max-w-[95vw] p-7'):
+            ui.label('Editar usuario').classes('text-2xl font-bold mb-2')
+
+            username = ui.input('Usuario', value=username_actual).props('outlined').classes('w-full')
+            nombre = ui.input('Nombre completo', value=nombre_actual).props('outlined').classes('w-full')
+            rol = ui.select(ROLES, value=rol_actual_valor, label='Rol').props('outlined').classes('w-full')
+            password = ui.input(
+                'Nueva contraseña (opcional)', password=True, password_toggle_button=True,
+                placeholder='Dejar en blanco para no cambiarla'
+            ).props('outlined').classes('w-full')
+
+            with ui.row().classes('w-full justify-end gap-2 mt-5'):
+                ui.button('Cancelar', on_click=dialog.close).props('flat')
+
+                def guardar():
+                    nuevo_username = username.value.strip()
+                    if not nuevo_username or not nombre.value.strip():
+                        ui.notify('Usuario y nombre son obligatorios.', type='negative')
+                        return
+                    if password.value and len(password.value) < 4:
+                        ui.notify('La contraseña debe tener al menos 4 caracteres.', type='negative')
+                        return
+
+                    otro = obtener_usuario(nuevo_username)
+                    if otro and otro[0] != user_id:
+                        ui.notify('Ese nombre de usuario ya lo usa otra cuenta.', type='negative')
+                        return
+
+                    actualizar_usuario(user_id, nuevo_username, nombre.value.strip(),
+                                       rol.value, password.value or None)
+                    ui.notify('Usuario actualizado.', type='positive')
+                    dialog.close()
+                    al_guardar()
+
+                ui.button('Guardar cambios', icon='save', on_click=guardar).props('unelevated color=primary')
 
     dialog.open()
 
@@ -871,7 +975,7 @@ def pagina_usuarios():
             with ui.row().classes('w-full items-center justify-between'):
                 with ui.column().classes('gap-0'):
                     ui.label('Usuarios').classes('page-title')
-                    ui.label('Cuentas de acceso: dueño, profes y clientes.').classes('page-subtitle')
+                    ui.label('Cuentas de acceso: dueño y profes.').classes('page-subtitle')
                 ui.button('Nuevo usuario', icon='person_add',
                           on_click=lambda: abrir_formulario_usuario(refrescar)) \
                     .props('unelevated color=primary').classes('px-5')
@@ -881,13 +985,16 @@ def pagina_usuarios():
                     {'name': 'username', 'label': 'USUARIO', 'field': 'username', 'align': 'left'},
                     {'name': 'nombre', 'label': 'NOMBRE', 'field': 'nombre', 'align': 'left'},
                     {'name': 'rol', 'label': 'ROL', 'field': 'rol', 'align': 'left'},
-                    {'name': 'dni_asociado', 'label': 'DNI VINCULADO', 'field': 'dni_asociado', 'align': 'left'},
                     {'name': 'acciones', 'label': '', 'field': 'acciones', 'align': 'right'},
                 ]
                 tabla = ui.table(columns=columnas, rows=[], row_key='id').classes('w-full')
 
                 tabla.add_slot('body-cell-acciones', '''
                     <q-td :props="props">
+                        <q-btn flat round dense icon="edit" color="primary"
+                               @click="$parent.$emit('editar', props.row)">
+                            <q-tooltip>Editar usuario</q-tooltip>
+                        </q-btn>
                         <q-btn v-if="props.row.username !== 'admin'" flat round dense icon="delete"
                                color="negative" @click="$parent.$emit('eliminar', props.row)">
                             <q-tooltip>Eliminar usuario</q-tooltip>
@@ -895,17 +1002,20 @@ def pagina_usuarios():
                     </q-td>
                 ''')
 
+                def on_editar(e):
+                    abrir_formulario_editar_usuario(e.args['id'], refrescar)
+
                 def on_eliminar(e):
                     eliminar_usuario(e.args['id'])
                     ui.notify('Usuario eliminado.', type='positive')
                     refrescar()
 
+                tabla.on('editar', on_editar)
                 tabla.on('eliminar', on_eliminar)
 
                 def refrescar():
                     tabla.rows = [
-                        {'id': u[0], 'username': u[1], 'nombre': u[2],
-                         'rol': u[3], 'dni_asociado': u[4] or '-'}
+                        {'id': u[0], 'username': u[1], 'nombre': u[2], 'rol': u[3]}
                         for u in obtener_todos_usuarios()
                     ]
 
@@ -920,15 +1030,13 @@ def pagina_usuarios():
 
 inicializar_db()
 
-# Un solo ui.run(): si está la variable de entorno PORT (típico en
-# servicios de hosting como Render/Railway) se usa esa, si no, 8080.
 ui.run(
     title='Gimnasio Vida Fitness',
     favicon='🏋️',
     reload=False,
     storage_secret='gimnasio_vida_fitness_secret',
-    ),
 )
+
 ui.run(
     host='0.0.0.0',
     port=int(os.environ.get('PORT', 8080)),

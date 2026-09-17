@@ -18,11 +18,12 @@ CARPETA_RUTINAS = 'rutinas'
 ROLES = ['dueño', 'profe']  # el rol 'cliente' no vive en esta tabla: se entra solo con el DNI
 
 INFO_IMPORTANTE = """
-- El gimnasio abre de lunes a sábado de 7:00 a 22:00 hs.
+- El gimnasio abre de lunes a viernes de 8:00 a 12:00 hs. y de 15:00 a 23:00 hs.
+Los sabados abre de 9:30 a 12:30 hs.
 - Traé una toalla propia para usar las máquinas.
 - Avisá con anticipación si vas a dejar de asistir, para no acumular
   atraso en el vencimiento.
-- Cualquier consulta sobre tu cuota, hablá con recepción.
+- Cualquier consulta sobre tu cuota, hablá con los profes.
 """
 
 

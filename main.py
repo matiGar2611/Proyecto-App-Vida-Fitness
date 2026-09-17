@@ -13,12 +13,21 @@ from datetime import date, timedelta, datetime
 
 DB_USUARIOS = 'usuarios.db'
 ARCHIVO_CLIENTES = 'Clientes.json'
+CARPETA_RUTINAS = 'rutinas'
 
-ROLES = ['dueño', 'profe']
+ROLES = ['dueño', 'profe']  # el rol 'cliente' no vive en esta tabla: se entra solo con el DNI
+
+INFO_IMPORTANTE = """
+- El gimnasio abre de lunes a sábado de 7:00 a 22:00 hs.
+- Traé una toalla propia para usar las máquinas.
+- Avisá con anticipación si vas a dejar de asistir, para no acumular
+  atraso en el vencimiento.
+- Cualquier consulta sobre tu cuota, hablá con recepción.
+"""
 
 
 # ============================================================
-# BASE DE DATOS DE USUARIOS (login + roles)
+# BASE DE DATOS DE USUARIOS (dueño / profe)
 # ============================================================
 
 def conectar_db():
@@ -40,7 +49,6 @@ def inicializar_db():
     """)
     conn.commit()
 
-    # Migración: agrega columnas si venían de una versión anterior.
     cursor.execute("PRAGMA table_info(usuarios)")
     columnas_existentes = {fila[1] for fila in cursor.fetchall()}
     if "rol" not in columnas_existentes:
@@ -148,17 +156,27 @@ def eliminar_usuario(user_id):
 
 
 # ---- Sesión y permisos ----
+# El rol 'cliente' NO vive en usuarios.db: se arma en el momento del
+# login por DNI (ver pagina_login) y se guarda solo en app.storage.user.
 
 def verificar_autenticacion():
-    return 'username' in app.storage.user
+    return 'rol' in app.storage.user
 
 
 def rol_actual():
     return app.storage.user.get('rol')
 
 
+def dni_actual():
+    return app.storage.user.get('dni')
+
+
 def es_dueño():
     return rol_actual() == 'dueño'
+
+
+def es_cliente_rol():
+    return rol_actual() == 'cliente'
 
 
 def requerir_autenticacion():
@@ -272,6 +290,12 @@ def esta_vencido(cliente):
     return fecha_vencimiento < date.today()
 
 
+def dias_para_vencimiento(cliente):
+    """Positivo: días que faltan para vencer. Negativo: días desde que venció."""
+    fecha_vencimiento = datetime.strptime(cliente["Fecha de vencimiento"], "%Y-%m-%d").date()
+    return (fecha_vencimiento - date.today()).days
+
+
 def obtener_filas(solo_vencidos=False, plan_filtro="Todos"):
     filas = []
     for cliente in cargar_clientes():
@@ -293,10 +317,6 @@ def obtener_filas(solo_vencidos=False, plan_filtro="Todos"):
 
 
 def proximos_cumpleanos(dias_rango=30):
-    """Para cada cliente con fecha de nacimiento, calcula cuántos días
-    faltan para su PRÓXIMO cumpleaños (comparando solo mes y día, sin
-    importar en qué año nació), y devuelve los que caen dentro del
-    rango, ordenados del más próximo al más lejano."""
     hoy = date.today()
     resultados = []
 
@@ -310,7 +330,6 @@ def proximos_cumpleanos(dias_rango=30):
         try:
             proximo = fecha_nac.replace(year=hoy.year)
         except ValueError:
-            # 29 de febrero en un año que no es bisiesto
             proximo = fecha_nac.replace(year=hoy.year, day=28)
 
         if proximo < hoy:
@@ -331,6 +350,29 @@ def proximos_cumpleanos(dias_rango=30):
 
     resultados.sort(key=lambda r: r["dias_faltantes"])
     return resultados
+
+
+# ============================================================
+# RUTINAS EN PDF (una por cliente, nombrada por DNI)
+# ============================================================
+
+def ruta_rutina(dni):
+    return os.path.join(CARPETA_RUTINAS, f"{dni}.pdf")
+
+
+def existe_rutina(dni):
+    return os.path.exists(ruta_rutina(dni))
+
+
+def guardar_rutina(dni, contenido_bytes):
+    os.makedirs(CARPETA_RUTINAS, exist_ok=True)
+    with open(ruta_rutina(dni), "wb") as archivo:
+        archivo.write(contenido_bytes)
+
+
+def leer_rutina(dni):
+    with open(ruta_rutina(dni), "rb") as archivo:
+        return archivo.read()
 
 
 # ============================================================
@@ -485,6 +527,32 @@ body {
     margin-bottom: 6px;
     font-weight: 700;
 }
+
+.mi-cuenta-card {
+    background: rgba(255, 255, 255, 0.65);
+    backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
+    border: 1px solid rgba(255, 255, 255, 0.8); border-radius: 24px;
+    box-shadow: 0 25px 60px rgba(21, 128, 61, 0.14);
+    padding: 32px; width: 560px; max-width: 95vw;
+}
+.dato-fila { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(0,0,0,0.06); }
+.dato-label { color: #5c6b62; font-weight: 600; }
+.dato-valor { color: #10241a; font-weight: 700; }
+
+.venc-ok {
+    background: rgba(74, 222, 128, 0.25); border: 1px solid rgba(22, 163, 74, 0.35);
+    border-radius: 14px; padding: 16px 20px; font-weight: 700; color: #14532d;
+}
+.venc-vencido {
+    background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 14px; padding: 16px 20px; font-weight: 700; color: #991b1b;
+}
+
+.info-importante {
+    background: rgba(250, 204, 21, 0.14); border: 1px solid rgba(202, 138, 4, 0.3);
+    border-radius: 14px; padding: 16px 20px; color: #713f12; font-size: 14px; line-height: 1.7;
+    white-space: pre-line;
+}
 """
 
 
@@ -503,12 +571,16 @@ def construir_navbar():
 
             ui.space()
 
-            ui.button('Clientes', icon='groups', on_click=lambda: ui.navigate.to('/')) \
-                .props('flat').classes('nav-button')
-
-            if es_dueño():
-                ui.button('Usuarios', icon='manage_accounts', on_click=lambda: ui.navigate.to('/usuarios')) \
+            if es_cliente_rol():
+                ui.button('Mi cuenta', icon='person', on_click=lambda: ui.navigate.to('/mi-cuenta')) \
                     .props('flat').classes('nav-button')
+            else:
+                ui.button('Clientes', icon='groups', on_click=lambda: ui.navigate.to('/')) \
+                    .props('flat').classes('nav-button')
+                if es_dueño():
+                    ui.button('Usuarios', icon='manage_accounts',
+                              on_click=lambda: ui.navigate.to('/usuarios')) \
+                        .props('flat').classes('nav-button')
 
             ui.separator().props('vertical').classes('mx-2').style('height: 28px;')
 
@@ -529,74 +601,220 @@ def construir_footer():
 
 
 # ============================================================
-# PÁGINA: LOGIN
+# PÁGINA: LOGIN (elige Administrador o Cliente)
 # ============================================================
 
 @ui.page('/login')
 def pagina_login():
     if verificar_autenticacion():
-        ui.navigate.to('/')
+        ui.navigate.to('/mi-cuenta' if es_cliente_rol() else '/')
         return
 
     ui.add_head_html(f'<style>{CSS}</style>')
 
     with ui.element('div').classes('login-page w-full'):
         with ui.element('div').classes('login-card'):
-            with ui.column().classes('items-center gap-4 mb-6 w-full'):
+            with ui.column().classes('items-center gap-4 mb-4 w-full'):
                 with ui.element('div').classes('logo-icon'):
                     ui.icon('fitness_center').classes('text-3xl')
                 ui.label('Gimnasio Vida Fitness').classes('login-title')
-                ui.label('Ingresá tu usuario y contraseña.').classes('login-subtitle')
+                ui.label('¿Cómo querés ingresar?').classes('login-subtitle')
 
-            error_container = ui.column().classes('w-full')
+            selector = ui.column().classes('w-full')
+            contenedor_admin = ui.column().classes('w-full')
+            contenedor_cliente = ui.column().classes('w-full')
+            contenedor_admin.visible = False
+            contenedor_cliente.visible = False
 
-            username_input = ui.input('Usuario').props('outlined').classes('w-full')
-            password_input = ui.input(
-                'Contraseña', password=True, password_toggle_button=True
-            ).props('outlined').classes('w-full')
+            with selector:
+                with ui.row().classes('w-full gap-2'):
+                    def elegir_admin():
+                        selector.visible = False
+                        contenedor_admin.visible = True
 
-            def intentar_login():
-                error_container.clear()
-                usuario = username_input.value.strip()
-                clave = password_input.value
+                    def elegir_cliente():
+                        selector.visible = False
+                        contenedor_cliente.visible = True
 
-                if not usuario or not clave:
-                    with error_container:
-                        ui.label('Completá usuario y contraseña').classes('login-error w-full')
-                    return
+                    ui.button('Administrador / Profe', icon='admin_panel_settings',
+                              on_click=elegir_admin).props('unelevated color=primary').classes('flex-1')
+                    ui.button('Soy cliente', icon='person',
+                              on_click=elegir_cliente).props('outline color=primary').classes('flex-1')
 
-                registro = obtener_usuario(usuario)
-                if registro is None:
-                    with error_container:
-                        ui.label('Usuario no encontrado').classes('login-error w-full')
-                    return
+            # ---- Formulario Administrador / Profe ----
+            with contenedor_admin:
+                error_admin = ui.column().classes('w-full')
+                username_input = ui.input('Usuario').props('outlined').classes('w-full')
+                password_input = ui.input(
+                    'Contraseña', password=True, password_toggle_button=True
+                ).props('outlined').classes('w-full')
 
-                if not verificar_password(clave, registro[3], registro[2]):
-                    with error_container:
-                        ui.label('Contraseña incorrecta').classes('login-error w-full')
-                    return
+                def intentar_login_admin():
+                    error_admin.clear()
+                    usuario = username_input.value.strip()
+                    clave = password_input.value
 
-                app.storage.user['id'] = registro[0]
-                app.storage.user['username'] = registro[1]
-                app.storage.user['nombre'] = registro[4]
-                app.storage.user['rol'] = registro[5]
+                    if not usuario or not clave:
+                        with error_admin:
+                            ui.label('Completá usuario y contraseña').classes('login-error w-full')
+                        return
 
-                ui.notify(f'Bienvenido, {registro[4]}', type='positive')
-                ui.navigate.to('/')
+                    registro = obtener_usuario(usuario)
+                    if registro is None:
+                        with error_admin:
+                            ui.label('Usuario no encontrado').classes('login-error w-full')
+                        return
 
-            ui.button('Ingresar', icon='login', on_click=intentar_login) \
-                .props('unelevated color=primary').classes('w-full mt-2')
+                    if not verificar_password(clave, registro[3], registro[2]):
+                        with error_admin:
+                            ui.label('Contraseña incorrecta').classes('login-error w-full')
+                        return
 
-            username_input.on('keydown.enter', lambda e: intentar_login())
-            password_input.on('keydown.enter', lambda e: intentar_login())
+                    app.storage.user['id'] = registro[0]
+                    app.storage.user['username'] = registro[1]
+                    app.storage.user['nombre'] = registro[4]
+                    app.storage.user['rol'] = registro[5]
 
-            with ui.element('div').classes('login-hint'):
-                ui.label('Cuenta por defecto (dueño)').classes('login-hint-label')
-                ui.label('Usuario: admin · Contraseña: admin123').classes('login-hint-text')
+                    ui.notify(f'Bienvenido, {registro[4]}', type='positive')
+                    ui.navigate.to('/')
+
+                ui.button('Ingresar', icon='login', on_click=intentar_login_admin) \
+                    .props('unelevated color=primary').classes('w-full mt-2')
+                username_input.on('keydown.enter', lambda e: intentar_login_admin())
+                password_input.on('keydown.enter', lambda e: intentar_login_admin())
+
+                with ui.element('div').classes('login-hint'):
+                    ui.label('Cuenta por defecto (dueño)').classes('login-hint-label')
+                    ui.label('Usuario: admin · Contraseña: admin123').classes('login-hint-text')
+
+                def volver_admin():
+                    contenedor_admin.visible = False
+                    selector.visible = True
+
+                ui.button('Volver', icon='arrow_back', on_click=volver_admin) \
+                    .props('flat').classes('w-full mt-2')
+
+            # ---- Formulario Cliente (solo DNI) ----
+            with contenedor_cliente:
+                error_cliente = ui.column().classes('w-full')
+                dni_input = ui.input('Tu DNI').props('outlined').classes('w-full')
+
+                def intentar_login_cliente():
+                    error_cliente.clear()
+                    dni = dni_input.value.strip()
+
+                    if not dni:
+                        with error_cliente:
+                            ui.label('Ingresá tu DNI').classes('login-error w-full')
+                        return
+
+                    cliente = buscar_cliente_por_dni(dni)
+                    if cliente is None:
+                        with error_cliente:
+                            ui.label('No encontramos ese DNI. Consultá con recepción.') \
+                                .classes('login-error w-full')
+                        return
+
+                    app.storage.user['rol'] = 'cliente'
+                    app.storage.user['dni'] = dni
+                    app.storage.user['nombre'] = cliente['Nombre y  Apellido']
+
+                    ui.notify(f"Bienvenido, {cliente['Nombre y  Apellido']}", type='positive')
+                    ui.navigate.to('/mi-cuenta')
+
+                ui.button('Ingresar', icon='login', on_click=intentar_login_cliente) \
+                    .props('unelevated color=primary').classes('w-full mt-2')
+                dni_input.on('keydown.enter', lambda e: intentar_login_cliente())
+
+                def volver_cliente():
+                    contenedor_cliente.visible = False
+                    selector.visible = True
+
+                ui.button('Volver', icon='arrow_back', on_click=volver_cliente) \
+                    .props('flat').classes('w-full mt-2')
 
 
 # ============================================================
-# DIÁLOGOS: cliente (agregar / editar / pagar / eliminar)
+# PÁGINA: MI CUENTA (cliente)
+# ============================================================
+
+@ui.page('/mi-cuenta')
+def pagina_mi_cuenta():
+    if not requerir_autenticacion():
+        return
+
+    if not es_cliente_rol():
+        ui.navigate.to('/')
+        return
+
+    ui.add_head_html(f'<style>{CSS}</style>')
+    construir_navbar()
+
+    dni = dni_actual()
+    cliente = buscar_cliente_por_dni(dni) if dni else None
+
+    with ui.column().classes('w-full min-h-screen items-center justify-center py-8'):
+        with ui.element('div').classes('mi-cuenta-card'):
+            if cliente is None:
+                ui.label('No pudimos encontrar tu ficha. Consultá con recepción.') \
+                    .classes('login-error w-full')
+            else:
+                ui.label(f"¡Hola, {cliente['Nombre y  Apellido']}!").classes('page-title')
+                ui.label('Este es tu resumen en el gimnasio.').classes('page-subtitle mb-4')
+
+                # --- Vencimiento y días restantes ---
+                dias = dias_para_vencimiento(cliente)
+                vencido = esta_vencido(cliente)
+
+                with ui.column().classes(('venc-vencido' if vencido else 'venc-ok') + ' w-full mb-4'):
+                    ui.label(f"Próximo vencimiento: {formatear_fecha(cliente['Fecha de vencimiento'])}")
+                    if vencido:
+                        ui.label(f"Tu cuota está vencida hace {abs(dias)} día(s).")
+                    else:
+                        ui.label(f"Te quedan {dias} día(s) de cuota vigente.")
+
+                # --- Tus datos ---
+                ui.label('Tus datos').classes('text-lg font-bold mt-2 mb-1')
+                datos = [
+                    ('DNI', cliente['DNI']),
+                    ('Teléfono', cliente['Telefono']),
+                    ('Plan', cliente['Plan']),
+                    ('Fecha de nacimiento',
+                        formatear_fecha(cliente['Fecha de nacimiento'])
+                        if cliente.get('Fecha de nacimiento') else '-'),
+                    ('Último pago', formatear_fecha(cliente['Fecha ultimo pago'])),
+                    ('Estado', 'Activo' if cliente['Cliente Activo'] else 'Inactivo'),
+                ]
+                for etiqueta, valor in datos:
+                    with ui.row().classes('dato-fila w-full'):
+                        ui.label(etiqueta).classes('dato-label')
+                        ui.label(str(valor)).classes('dato-valor')
+
+                # --- Información importante ---
+                ui.label('Información importante').classes('text-lg font-bold mt-5 mb-1')
+                with ui.column().classes('info-importante w-full'):
+                    ui.label(INFO_IMPORTANTE.strip())
+
+                # --- Rutina ---
+                ui.label('Mi rutina').classes('text-lg font-bold mt-5 mb-1')
+                with ui.column().classes('glass-card w-full p-4'):
+                    if existe_rutina(dni):
+                        ui.label('Tu profe te dejó una rutina cargada.').classes('text-sm text-gray-600 mb-2')
+
+                        def descargar():
+                            ui.download(leer_rutina(dni), f'rutina_{dni}.pdf')
+
+                        ui.button('Descargar mi rutina (PDF)', icon='download', on_click=descargar) \
+                            .props('unelevated color=primary')
+                    else:
+                        ui.label('Todavía no tenés una rutina cargada. Consultá con tu profe.') \
+                            .classes('text-sm text-gray-600')
+
+        construir_footer()
+
+
+# ============================================================
+# DIÁLOGOS: cliente (agregar / editar / pagar / rutina / eliminar)
 # ============================================================
 
 def abrir_formulario_cliente(al_guardar):
@@ -720,6 +938,36 @@ def abrir_dialogo_pago(dni, nombre, al_registrar):
     dialog.open()
 
 
+def abrir_dialogo_rutina(dni, nombre):
+    """El profe o el dueño suben (o reemplazan) el PDF de rutina de un
+    cliente puntual."""
+    with ui.dialog() as dialog:
+        with ui.card().classes('w-[420px] max-w-[95vw] p-7'):
+            ui.label('Rutina de entrenamiento').classes('text-xl font-bold')
+            ui.label(f'Cliente: {nombre}').classes('text-gray-600 mb-3')
+
+            if existe_rutina(dni):
+                ui.label('Ya tiene una rutina cargada. Subir un PDF nuevo la reemplaza.') \
+                    .classes('text-sm text-gray-500 mb-2')
+            else:
+                ui.label('Este cliente todavía no tiene una rutina cargada.') \
+                    .classes('text-sm text-gray-500 mb-2')
+
+            def manejar_subida(evento):
+                contenido = evento.content.read()
+                guardar_rutina(dni, contenido)
+                ui.notify('Rutina en PDF guardada correctamente.', type='positive')
+                dialog.close()
+
+            ui.upload(on_upload=manejar_subida, auto_upload=True) \
+                .props('accept=".pdf" label="Elegir archivo PDF"').classes('w-full')
+
+            with ui.row().classes('w-full justify-end mt-4'):
+                ui.button('Cerrar', on_click=dialog.close).props('flat')
+
+    dialog.open()
+
+
 def confirmar_eliminacion(dni, nombre, al_eliminar):
     with ui.dialog() as dialog:
         with ui.card().classes('p-7 w-[400px] max-w-[95vw]'):
@@ -740,12 +988,16 @@ def confirmar_eliminacion(dni, nombre, al_eliminar):
 
 
 # ============================================================
-# PÁGINA PRINCIPAL
+# PÁGINA PRINCIPAL (dueño / profe)
 # ============================================================
 
 @ui.page('/')
 def pagina_principal():
     if not requerir_autenticacion():
+        return
+
+    if es_cliente_rol():
+        ui.navigate.to('/mi-cuenta')
         return
 
     dar_baja_automatica()
@@ -771,8 +1023,7 @@ def pagina_principal():
                     ui.label('Cuotas vencidas').classes('stat-label')
                     etiqueta_vencidos = ui.label('0').classes('stat-value')
 
-            # ---- Panel de cumpleaños: siempre visible, se recalcula
-            # cada vez que se agrega/edita/paga un cliente ----
+            # Panel de cumpleaños: siempre visible.
             with ui.column().classes('glass-card w-full p-5'):
                 ui.label('🎂 Próximos cumpleaños (30 días)').classes('text-lg font-bold mb-2')
                 contenedor_cumples = ui.column().classes('w-full')
@@ -807,6 +1058,7 @@ def pagina_principal():
                         </q-btn>
                 ''' if es_dueño() else ''
 
+                # El ícono de PDF (asignar rutina) lo pueden usar dueño y profe.
                 tabla.add_slot('body-cell-acciones', f'''
                     <q-td :props="props">
                         <q-btn flat round dense icon="edit" color="primary"
@@ -816,6 +1068,10 @@ def pagina_principal():
                         <q-btn flat round dense icon="payments" color="primary"
                                @click="$parent.$emit('pagar', props.row)">
                             <q-tooltip>Registrar pago</q-tooltip>
+                        </q-btn>
+                        <q-btn flat round dense icon="picture_as_pdf" color="primary"
+                               @click="$parent.$emit('rutina', props.row)">
+                            <q-tooltip>Subir rutina en PDF</q-tooltip>
                         </q-btn>
                         {boton_eliminar_html}
                     </q-td>
@@ -827,6 +1083,9 @@ def pagina_principal():
                 def on_pagar(e):
                     abrir_dialogo_pago(e.args['dni'], e.args['nombre'], refrescar)
 
+                def on_rutina(e):
+                    abrir_dialogo_rutina(e.args['dni'], e.args['nombre'])
+
                 def on_eliminar(e):
                     if not es_dueño():
                         ui.notify('No tenés permisos para eliminar clientes.', type='negative')
@@ -835,6 +1094,7 @@ def pagina_principal():
 
                 tabla.on('editar', on_editar)
                 tabla.on('pagar', on_pagar)
+                tabla.on('rutina', on_rutina)
                 tabla.on('eliminar', on_eliminar)
 
             def refrescar():
@@ -870,7 +1130,7 @@ def pagina_principal():
 
 
 # ============================================================
-# PÁGINA: USUARIOS (solo dueño) -- crear y editar
+# PÁGINA: USUARIOS (solo dueño) -- cuentas de dueño y profe
 # ============================================================
 
 def abrir_formulario_usuario(al_guardar):

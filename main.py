@@ -13,7 +13,6 @@ from datetime import date, timedelta, datetime
 
 DB_USUARIOS = 'usuarios.db'
 ARCHIVO_CLIENTES = 'Clientes.json'
-CARPETA_RUTINAS = 'rutinas'
 
 ROLES = ['dueño', 'profe']  # el rol 'cliente' no vive en esta tabla: se entra solo con el DNI
 
@@ -233,6 +232,7 @@ def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
         "Fecha de vencimiento": str(hoy + timedelta(days=30)),
         "Fecha ultimo pago": str(hoy),
         "Cliente Activo": True,
+        "Rutina": "",
     }
 
 
@@ -355,33 +355,16 @@ def proximos_cumpleanos(dias_rango=30):
 
 
 # ============================================================
-# RUTINAS EN PDF (una por cliente, nombrada por DNI)
+# RUTINA DE CADA CLIENTE (texto simple, guardado dentro de Clientes.json)
 # ============================================================
 
-def ruta_rutina(dni):
-    return os.path.join(CARPETA_RUTINAS, f"{dni}.pdf")
-
-
-def existe_rutina(dni):
-    return os.path.exists(ruta_rutina(dni))
-
-
-def guardar_rutina(dni, contenido_bytes):
-    os.makedirs(CARPETA_RUTINAS, exist_ok=True)
-    with open(ruta_rutina(dni), "wb") as archivo:
-        archivo.write(contenido_bytes)
-
-
-def leer_rutina(dni):
-    with open(ruta_rutina(dni), "rb") as archivo:
-        return archivo.read()
-
-
-def eliminar_rutina(dni):
-    ruta = ruta_rutina(dni)
-    if os.path.exists(ruta):
-        os.remove(ruta)
-        return True
+def actualizar_rutina(dni, texto_rutina):
+    lista_clientes = cargar_clientes()
+    for cliente in lista_clientes:
+        if cliente["DNI"] == dni:
+            cliente["Rutina"] = texto_rutina
+            guardar_clientes(lista_clientes)
+            return True
     return False
 
 
@@ -580,6 +563,12 @@ body {
 .info-importante {
     background: rgba(250, 204, 21, 0.14); border: 1px solid rgba(202, 138, 4, 0.3);
     border-radius: 14px; padding: 16px 20px; color: #713f12; font-size: 14px; line-height: 1.7;
+    white-space: pre-line;
+}
+
+.rutina-cliente {
+    background: rgba(59, 130, 246, 0.12); border: 1px solid rgba(37, 99, 235, 0.3);
+    border-radius: 14px; padding: 16px 20px; color: #1e3a8a; font-size: 14px; line-height: 1.7;
     white-space: pre-line;
 }
 """
@@ -829,18 +818,12 @@ def pagina_mi_cuenta():
 
                 # --- Rutina ---
                 ui.label('Mi rutina').classes('text-lg font-bold mt-5 mb-1')
-                with ui.column().classes('glass-card w-full p-4'):
-                    if existe_rutina(dni):
-                        ui.label('Tu profe te dejó una rutina cargada.').classes('text-sm text-gray-600 mb-2')
-
-                        def descargar():
-                            ui.download(leer_rutina(dni), f'rutina_{dni}.pdf')
-
-                        ui.button('Descargar mi rutina (PDF)', icon='download', on_click=descargar) \
-                            .props('unelevated color=primary')
+                texto_rutina = cliente.get('Rutina', '').strip()
+                with ui.column().classes('rutina-cliente w-full'):
+                    if texto_rutina:
+                        ui.label(texto_rutina)
                     else:
-                        ui.label('Todavía no tenés una rutina cargada. Consultá con tu profe.') \
-                            .classes('text-sm text-gray-600')
+                        ui.label('Todavía no tenés una rutina cargada. Consultá con tu profe.')
 
         construir_footer()
 
@@ -971,59 +954,37 @@ def abrir_dialogo_pago(dni, nombre, al_registrar):
 
 
 def abrir_dialogo_rutina(dni, nombre, al_cambiar=None):
-    """El profe o el dueño suben, reemplazan o eliminan el PDF de
-    rutina de un cliente puntual (queda guardado en el perfil del
-    cliente, identificado por su DNI)."""
+    """El profe o el dueño escriben (o borran) la rutina de un cliente
+    puntual, como texto simple guardado en su ficha (Clientes.json)."""
+    cliente = buscar_cliente_por_dni(dni)
+    texto_actual = cliente.get('Rutina', '') if cliente else ''
+
     with ui.dialog() as dialog:
-        with ui.card().classes('w-[420px] max-w-[95vw] p-7'):
+        with ui.card().classes('w-[520px] max-w-[95vw] p-7'):
             ui.label('Rutina de entrenamiento').classes('text-xl font-bold')
             ui.label(f'Cliente: {nombre}').classes('text-gray-600 mb-3')
 
-            estado_container = ui.column().classes('w-full')
+            area_rutina = ui.textarea(value=texto_actual, placeholder='Escribí acá la rutina...') \
+                .props('outlined rows=8').classes('w-full')
 
-            def refrescar_estado():
-                estado_container.clear()
-                with estado_container:
-                    if existe_rutina(dni):
-                        ui.label('Este cliente ya tiene una rutina cargada.') \
-                            .classes('text-sm text-gray-600 mb-2')
+            with ui.row().classes('w-full justify-between gap-2 mt-4'):
+                def borrar():
+                    area_rutina.value = ''
 
-                        def eliminar():
-                            eliminar_rutina(dni)
-                            ui.notify('Rutina eliminada.', type='positive')
-                            refrescar_estado()
-                            if al_cambiar:
-                                al_cambiar()
+                ui.button('Vaciar', icon='delete', on_click=borrar).props('outline color=negative')
 
-                        ui.button('Eliminar rutina actual', icon='delete', on_click=eliminar) \
-                            .props('outline color=negative').classes('w-full mb-3')
-                    else:
-                        ui.label('Este cliente todavía no tiene una rutina cargada.') \
-                            .classes('text-sm text-gray-600 mb-2')
+                with ui.row().classes('gap-2'):
+                    ui.button('Cerrar', on_click=dialog.close).props('flat')
 
-            refrescar_estado()
+                    def guardar():
+                        actualizar_rutina(dni, area_rutina.value.strip())
+                        ui.notify('Rutina guardada en el perfil del cliente.', type='positive')
+                        dialog.close()
+                        if al_cambiar:
+                            al_cambiar()
 
-            def manejar_subida(evento):
-                contenido = evento.content.read()
-                guardar_rutina(dni, contenido)
-                ui.notify('Rutina subida correctamente al perfil del cliente.', type='positive')
-                refrescar_estado()
-                if al_cambiar:
-                    al_cambiar()
-
-            ui.label('Subir rutina (reemplaza la actual si ya había una):') \
-                .classes('text-sm text-gray-600')
-            upload_widget = ui.upload(on_upload=manejar_subida, auto_upload=False) \
-                .props('accept=".pdf" label="Seleccionar PDF"').classes('w-full')
-
-            async def cargar_rutina_click():
-                await upload_widget.run_method('upload')
-
-            ui.button('Cargar rutina', icon='upload', on_click=cargar_rutina_click) \
-                .props('unelevated color=primary').classes('w-full mt-2')
-
-            with ui.row().classes('w-full justify-end mt-4'):
-                ui.button('Cerrar', on_click=dialog.close).props('flat')
+                    ui.button('Guardar rutina', icon='save', on_click=guardar) \
+                        .props('unelevated color=primary')
 
     dialog.open()
 
@@ -1129,9 +1090,9 @@ def pagina_principal():
                                @click="$parent.$emit('pagar', props.row)">
                             <q-tooltip>Registrar pago</q-tooltip>
                         </q-btn>
-                        <q-btn flat round dense icon="picture_as_pdf" color="primary"
+                        <q-btn flat round dense icon="edit_note" color="primary"
                                @click="$parent.$emit('rutina', props.row)">
-                            <q-tooltip>Subir rutina en PDF</q-tooltip>
+                            <q-tooltip>Rutina (texto)</q-tooltip>
                         </q-btn>
                         {boton_eliminar_html}
                     </q-td>

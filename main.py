@@ -1013,8 +1013,10 @@ def abrir_dialogo_rutina(dni, nombre, al_cambiar=None):
 
             ui.label('Subir rutina (reemplaza la actual si ya había una):') \
                 .classes('text-sm text-gray-600')
-            ui.upload(on_upload=manejar_subida, auto_upload=True) \
-                .props('accept=".pdf" label="Subir Rutina"').classes('w-full')
+            upload_widget = ui.upload(on_upload=manejar_subida, auto_upload=False) \
+                .props('accept=".pdf" label="Seleccionar PDF"').classes('w-full')
+            ui.button('Cargar rutina', icon='upload', on_click=lambda: upload_widget.submit()) \
+                .props('unelevated color=primary').classes('w-full mt-2')
 
             with ui.row().classes('w-full justify-end mt-4'):
                 ui.button('Cerrar', on_click=dialog.close).props('flat')

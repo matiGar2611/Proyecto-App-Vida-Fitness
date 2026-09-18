@@ -1015,7 +1015,11 @@ def abrir_dialogo_rutina(dni, nombre, al_cambiar=None):
                 .classes('text-sm text-gray-600')
             upload_widget = ui.upload(on_upload=manejar_subida, auto_upload=False) \
                 .props('accept=".pdf" label="Seleccionar PDF"').classes('w-full')
-            ui.button('Cargar rutina', icon='upload', on_click=lambda: upload_widget.run_method('upload')) \
+
+            async def cargar_rutina_click():
+                await upload_widget.run_method('upload')
+
+            ui.button('Cargar rutina', icon='upload', on_click=cargar_rutina_click) \
                 .props('unelevated color=primary').classes('w-full mt-2')
 
             with ui.row().classes('w-full justify-end mt-4'):

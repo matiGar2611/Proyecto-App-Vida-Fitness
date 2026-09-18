@@ -17,14 +17,15 @@ CARPETA_RUTINAS = 'rutinas'
 
 ROLES = ['dueño', 'profe']  # el rol 'cliente' no vive en esta tabla: se entra solo con el DNI
 
-INFO_IMPORTANTE = """
-- El gimnasio abre de lunes a viernes de 8:00 a 12:00 hs. y de 15:00 a 23:00 hs.
-Los sabados abre de 9:30 a 12:30 hs.
+ARCHIVO_INFORMACION = 'informacion.json'
+
+INFO_IMPORTANTE_POR_DEFECTO = """
+- El gimnasio abre de lunes a sábado de 7:00 a 22:00 hs.
 - Traé una toalla propia para usar las máquinas.
 - Avisá con anticipación si vas a dejar de asistir, para no acumular
   atraso en el vencimiento.
-- Cualquier consulta sobre tu cuota, hablá con los profes.
-"""
+- Cualquier consulta sobre tu cuota, hablá con recepción.
+""".strip()
 
 
 # ============================================================
@@ -376,6 +377,33 @@ def leer_rutina(dni):
         return archivo.read()
 
 
+def eliminar_rutina(dni):
+    ruta = ruta_rutina(dni)
+    if os.path.exists(ruta):
+        os.remove(ruta)
+        return True
+    return False
+
+
+# ============================================================
+# INFORMACIÓN PARA CLIENTES (editable por el dueño)
+# ============================================================
+
+def cargar_informacion():
+    """Texto que ven los clientes en 'Información importante'. Si
+    todavía no se guardó nada, usa el texto por defecto."""
+    if os.path.exists(ARCHIVO_INFORMACION):
+        with open(ARCHIVO_INFORMACION, "r", encoding="utf-8") as archivo:
+            datos = json.load(archivo)
+            return datos.get("texto", INFO_IMPORTANTE_POR_DEFECTO)
+    return INFO_IMPORTANTE_POR_DEFECTO
+
+
+def guardar_informacion(texto):
+    with open(ARCHIVO_INFORMACION, "w", encoding="utf-8") as archivo:
+        json.dump({"texto": texto}, archivo, ensure_ascii=False, indent=4)
+
+
 # ============================================================
 # ESTILOS GLASSMORPHISM -- gama de verdes
 # ============================================================
@@ -582,6 +610,9 @@ def construir_navbar():
                     ui.button('Usuarios', icon='manage_accounts',
                               on_click=lambda: ui.navigate.to('/usuarios')) \
                         .props('flat').classes('nav-button')
+                    ui.button('Información', icon='info',
+                              on_click=lambda: ui.navigate.to('/informacion')) \
+                        .props('flat').classes('nav-button')
 
             ui.separator().props('vertical').classes('mx-2').style('height: 28px;')
 
@@ -637,9 +668,9 @@ def pagina_login():
                         selector.visible = False
                         contenedor_cliente.visible = True
 
-                    ui.button('Administrador / Profe', icon='admin_panel_settings',
+                    ui.button('Profesor', icon='badge',
                               on_click=elegir_admin).props('unelevated color=primary').classes('flex-1')
-                    ui.button('Soy cliente', icon='person',
+                    ui.button('Cliente', icon='person',
                               on_click=elegir_cliente).props('outline color=primary').classes('flex-1')
 
             # ---- Formulario Administrador / Profe ----
@@ -794,7 +825,7 @@ def pagina_mi_cuenta():
                 # --- Información importante ---
                 ui.label('Información importante').classes('text-lg font-bold mt-5 mb-1')
                 with ui.column().classes('info-importante w-full'):
-                    ui.label(INFO_IMPORTANTE.strip())
+                    ui.label(cargar_informacion())
 
                 # --- Rutina ---
                 ui.label('Mi rutina').classes('text-lg font-bold mt-5 mb-1')
@@ -939,29 +970,51 @@ def abrir_dialogo_pago(dni, nombre, al_registrar):
     dialog.open()
 
 
-def abrir_dialogo_rutina(dni, nombre):
-    """El profe o el dueño suben (o reemplazan) el PDF de rutina de un
-    cliente puntual."""
+def abrir_dialogo_rutina(dni, nombre, al_cambiar=None):
+    """El profe o el dueño suben, reemplazan o eliminan el PDF de
+    rutina de un cliente puntual (queda guardado en el perfil del
+    cliente, identificado por su DNI)."""
     with ui.dialog() as dialog:
         with ui.card().classes('w-[420px] max-w-[95vw] p-7'):
             ui.label('Rutina de entrenamiento').classes('text-xl font-bold')
             ui.label(f'Cliente: {nombre}').classes('text-gray-600 mb-3')
 
-            if existe_rutina(dni):
-                ui.label('Ya tiene una rutina cargada. Subir un PDF nuevo la reemplaza.') \
-                    .classes('text-sm text-gray-500 mb-2')
-            else:
-                ui.label('Este cliente todavía no tiene una rutina cargada.') \
-                    .classes('text-sm text-gray-500 mb-2')
+            estado_container = ui.column().classes('w-full')
+
+            def refrescar_estado():
+                estado_container.clear()
+                with estado_container:
+                    if existe_rutina(dni):
+                        ui.label('Este cliente ya tiene una rutina cargada.') \
+                            .classes('text-sm text-gray-600 mb-2')
+
+                        def eliminar():
+                            eliminar_rutina(dni)
+                            ui.notify('Rutina eliminada.', type='positive')
+                            refrescar_estado()
+                            if al_cambiar:
+                                al_cambiar()
+
+                        ui.button('Eliminar rutina actual', icon='delete', on_click=eliminar) \
+                            .props('outline color=negative').classes('w-full mb-3')
+                    else:
+                        ui.label('Este cliente todavía no tiene una rutina cargada.') \
+                            .classes('text-sm text-gray-600 mb-2')
+
+            refrescar_estado()
 
             def manejar_subida(evento):
                 contenido = evento.content.read()
                 guardar_rutina(dni, contenido)
-                ui.notify('Rutina en PDF guardada correctamente.', type='positive')
-                dialog.close()
+                ui.notify('Rutina subida correctamente al perfil del cliente.', type='positive')
+                refrescar_estado()
+                if al_cambiar:
+                    al_cambiar()
 
+            ui.label('Subir rutina (reemplaza la actual si ya había una):') \
+                .classes('text-sm text-gray-600')
             ui.upload(on_upload=manejar_subida, auto_upload=True) \
-                .props('accept=".pdf" label="Elegir archivo PDF"').classes('w-full')
+                .props('accept=".pdf" label="Subir Rutina"').classes('w-full')
 
             with ui.row().classes('w-full justify-end mt-4'):
                 ui.button('Cerrar', on_click=dialog.close).props('flat')
@@ -1085,7 +1138,7 @@ def pagina_principal():
                     abrir_dialogo_pago(e.args['dni'], e.args['nombre'], refrescar)
 
                 def on_rutina(e):
-                    abrir_dialogo_rutina(e.args['dni'], e.args['nombre'])
+                    abrir_dialogo_rutina(e.args['dni'], e.args['nombre'], al_cambiar=refrescar)
 
                 def on_eliminar(e):
                     if not es_dueño():
@@ -1281,6 +1334,46 @@ def pagina_usuarios():
                     ]
 
                 refrescar()
+
+        construir_footer()
+
+
+# ============================================================
+# PÁGINA: INFORMACIÓN (solo dueño) -- edita lo que ve el cliente
+# ============================================================
+
+@ui.page('/informacion')
+def pagina_informacion():
+    if not requerir_autenticacion():
+        return
+
+    if not es_dueño():
+        ui.notify('No tenés permisos para acceder a esta página.', type='negative')
+        ui.navigate.to('/')
+        return
+
+    ui.add_head_html(f'<style>{CSS}</style>')
+    construir_navbar()
+
+    with ui.column().classes('w-full min-h-screen'):
+        with ui.column().classes('w-full max-w-3xl mx-auto p-8 gap-6'):
+
+            ui.label('Información importante').classes('page-title')
+            ui.label('Este texto es el que ven todos los clientes en su portal '
+                      '(horarios, uso de toallas, cómo avisar si van a dejar de '
+                      'asistir, etc.). Editalo y guardá los cambios.') \
+                .classes('page-subtitle')
+
+            with ui.column().classes('glass-card w-full p-6'):
+                texto = ui.textarea(value=cargar_informacion()) \
+                    .props('outlined rows=10').classes('w-full')
+
+                def guardar():
+                    guardar_informacion(texto.value.strip())
+                    ui.notify('Información actualizada. Ya la ven los clientes.', type='positive')
+
+                ui.button('Guardar cambios', icon='save', on_click=guardar) \
+                    .props('unelevated color=primary').classes('mt-3')
 
         construir_footer()
 

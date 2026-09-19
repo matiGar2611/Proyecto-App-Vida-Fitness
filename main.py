@@ -4,6 +4,8 @@ import hashlib
 import secrets
 import json
 import os
+import csv
+import io
 from urllib.parse import quote
 from datetime import date, timedelta, datetime
 
@@ -20,7 +22,7 @@ ROLES = ['dueño', 'profe']  # el rol 'cliente' no vive en esta tabla: se entra 
 # Número de WhatsApp del gimnasio para el botón de consultas del cliente.
 # Formato: código de país + número, SIN el "+", sin espacios ni guiones.
 # Ejemplo Argentina, Mendoza, celular 261 555-1234 -> "5492615551234"
-NUMERO_WHATSAPP_GIMNASIO = "5492634847749"  
+NUMERO_WHATSAPP_GIMNASIO = "5492634847749"  # <-- reemplazar por el número real
 
 ARCHIVO_INFORMACION = 'informacion.json'
 
@@ -35,6 +37,35 @@ INFO_IMPORTANTE_POR_DEFECTO = """
   atraso en el vencimiento.
 - Cualquier consulta sobre tu cuota, hablá con recepción.
 """.strip()
+
+ARCHIVO_PRECIOS = 'precios.json'
+
+PRECIOS_POR_DEFECTO = {
+    "2 veces por semana": 15000,
+    "3 veces por semana": 18000,
+    "Todos los días": 22000,
+}
+
+
+def cargar_precios():
+    """Devuelve el diccionario {plan: precio}. Si el archivo no existe
+    todavía, o le falta algún plan (por ejemplo, la primera vez que
+    corre esta versión), se completa con los valores por defecto."""
+    precios = dict(PRECIOS_POR_DEFECTO)
+    if os.path.exists(ARCHIVO_PRECIOS):
+        with open(ARCHIVO_PRECIOS, "r", encoding="utf-8") as archivo:
+            guardados = json.load(archivo)
+            precios.update(guardados)
+    return precios
+
+
+def guardar_precios(precios):
+    with open(ARCHIVO_PRECIOS, "w", encoding="utf-8") as archivo:
+        json.dump(precios, archivo, ensure_ascii=False, indent=4)
+
+
+def precio_de_plan(plan):
+    return cargar_precios().get(plan, 0)
 
 
 # ============================================================
@@ -54,6 +85,7 @@ def inicializar_db():
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
+            password_plain TEXT NOT NULL,
             nombre TEXT NOT NULL,
             rol TEXT NOT NULL
         )
@@ -64,6 +96,11 @@ def inicializar_db():
     columnas_existentes = {fila[1] for fila in cursor.fetchall()}
     if "rol" not in columnas_existentes:
         cursor.execute("ALTER TABLE usuarios ADD COLUMN rol TEXT NOT NULL DEFAULT 'dueño'")
+    if "password_plain" not in columnas_existentes:
+        # Migración: las cuentas creadas con una versión anterior no
+        # tenían la contraseña en texto plano guardada -- se completa
+        # con un valor visible de "desconocida" hasta que se cambie.
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN password_plain TEXT NOT NULL DEFAULT '(no registrada)'")
     conn.commit()
     conn.close()
     crear_usuario_dueño()
@@ -88,8 +125,9 @@ def crear_usuario_dueño():
     if cursor.fetchone()[0] == 0:
         salt, hash_val = hash_password('admin123')
         cursor.execute(
-            "INSERT INTO usuarios (username, password_hash, salt, nombre, rol) VALUES (?, ?, ?, ?, ?)",
-            ('admin', hash_val, salt, 'Dueño del gimnasio', 'dueño')
+            "INSERT INTO usuarios (username, password_hash, salt, password_plain, nombre, rol) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ('admin', hash_val, salt, 'admin123', 'Dueño del gimnasio', 'dueño')
         )
         conn.commit()
     conn.close()
@@ -99,7 +137,8 @@ def obtener_usuario(username):
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, username, password_hash, salt, nombre, rol FROM usuarios WHERE username = ?",
+        "SELECT id, username, password_hash, salt, nombre, rol, password_plain "
+        "FROM usuarios WHERE username = ?",
         (username,)
     )
     usuario = cursor.fetchone()
@@ -111,7 +150,8 @@ def obtener_usuario_por_id(user_id):
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, username, password_hash, salt, nombre, rol FROM usuarios WHERE id = ?",
+        "SELECT id, username, password_hash, salt, nombre, rol, password_plain "
+        "FROM usuarios WHERE id = ?",
         (user_id,)
     )
     usuario = cursor.fetchone()
@@ -122,7 +162,9 @@ def obtener_usuario_por_id(user_id):
 def obtener_todos_usuarios():
     conn = conectar_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, username, nombre, rol FROM usuarios ORDER BY rol, nombre")
+    cursor.execute(
+        "SELECT id, username, nombre, rol, password_plain FROM usuarios ORDER BY rol, nombre"
+    )
     usuarios = cursor.fetchall()
     conn.close()
     return usuarios
@@ -133,8 +175,9 @@ def crear_usuario(username, password, nombre, rol):
     cursor = conn.cursor()
     salt, hash_val = hash_password(password)
     cursor.execute(
-        "INSERT INTO usuarios (username, password_hash, salt, nombre, rol) VALUES (?, ?, ?, ?, ?)",
-        (username, hash_val, salt, nombre, rol)
+        "INSERT INTO usuarios (username, password_hash, salt, password_plain, nombre, rol) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (username, hash_val, salt, password, nombre, rol)
     )
     conn.commit()
     conn.close()
@@ -146,8 +189,9 @@ def actualizar_usuario(user_id, username, nombre, rol, nueva_password=None):
     if nueva_password:
         salt, hash_val = hash_password(nueva_password)
         cursor.execute(
-            "UPDATE usuarios SET username = ?, nombre = ?, rol = ?, password_hash = ?, salt = ? WHERE id = ?",
-            (username, nombre, rol, hash_val, salt, user_id)
+            "UPDATE usuarios SET username = ?, nombre = ?, rol = ?, "
+            "password_hash = ?, salt = ?, password_plain = ? WHERE id = ?",
+            (username, nombre, rol, hash_val, salt, nueva_password, user_id)
         )
     else:
         cursor.execute(
@@ -399,6 +443,32 @@ def ingresos_cobrados_mes_actual():
             if fecha_pago.year == hoy.year and fecha_pago.month == hoy.month:
                 total += pago.get("monto", 0)
     return total
+
+
+def exportar_clientes_csv(solo_vencidos=False, plan_filtro="Todos", busqueda=""):
+    """Arma el contenido de un CSV (como texto) con los clientes que
+    cumplen los filtros vigentes en la tabla. Se usa ';' como
+    separador porque Excel en configuración regional argentina/
+    española lo interpreta mejor que la ','."""
+    buffer = io.StringIO()
+    escritor = csv.writer(buffer, delimiter=';')
+    escritor.writerow([
+        'DNI', 'Nombre y Apellido', 'Teléfono', 'Plan', 'Fecha de nacimiento',
+        'Fecha de inicio', 'Fecha de vencimiento', 'Fecha ultimo pago', 'Activo',
+    ])
+    for cliente in filtrar_clientes(solo_vencidos, plan_filtro, busqueda):
+        escritor.writerow([
+            cliente['DNI'],
+            cliente['Nombre y  Apellido'],
+            cliente['Telefono'],
+            cliente['Plan'],
+            cliente.get('Fecha de nacimiento', ''),
+            cliente['Fecha de inicio'],
+            cliente['Fecha de vencimiento'],
+            cliente['Fecha ultimo pago'],
+            'Sí' if cliente['Cliente Activo'] else 'No',
+        ])
+    return buffer.getvalue()
 
 
 
@@ -681,6 +751,51 @@ body {
 # NAVBAR / FOOTER
 # ============================================================
 
+def abrir_dialogo_cambiar_mi_password():
+    """Cualquier usuario logueado (dueño o profe) puede cambiar su
+    propia contraseña, sin pasar por la página de Usuarios (esa es
+    solo para que el dueño administre las cuentas de los demás)."""
+    username_actual = app.storage.user.get('username')
+    registro = obtener_usuario(username_actual)
+    if registro is None:
+        ui.notify('No se pudo identificar tu cuenta.', type='negative')
+        return
+    user_id, username, password_hash, salt, nombre, rol = registro[0], registro[1], registro[2], registro[3], registro[4], registro[5]
+
+    with ui.dialog() as dialog:
+        with ui.card().classes('w-[420px] max-w-[95vw] p-7'):
+            ui.label('Cambiar mi contraseña').classes('text-xl font-bold mb-3')
+
+            actual = ui.input('Contraseña actual', password=True, password_toggle_button=True) \
+                .props('outlined').classes('w-full')
+            nueva = ui.input('Nueva contraseña', password=True, password_toggle_button=True) \
+                .props('outlined').classes('w-full')
+            confirmar = ui.input('Confirmar nueva contraseña', password=True, password_toggle_button=True) \
+                .props('outlined').classes('w-full')
+
+            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                ui.button('Cancelar', on_click=dialog.close).props('flat')
+
+                def guardar():
+                    if not verificar_password(actual.value, salt, password_hash):
+                        ui.notify('La contraseña actual no es correcta.', type='negative')
+                        return
+                    if not nueva.value or len(nueva.value) < 4:
+                        ui.notify('La nueva contraseña debe tener al menos 4 caracteres.', type='negative')
+                        return
+                    if nueva.value != confirmar.value:
+                        ui.notify('Las contraseñas nuevas no coinciden.', type='negative')
+                        return
+
+                    actualizar_usuario(user_id, username, nombre, rol, nueva.value)
+                    ui.notify('Contraseña actualizada correctamente.', type='positive')
+                    dialog.close()
+
+                ui.button('Guardar', icon='save', on_click=guardar).props('unelevated color=primary')
+
+    dialog.open()
+
+
 def construir_navbar():
     with ui.header().classes('app-header px-6'):
         with ui.row().classes('w-full items-center'):
@@ -702,9 +817,14 @@ def construir_navbar():
                     ui.button('Usuarios', icon='manage_accounts',
                               on_click=lambda: ui.navigate.to('/usuarios')) \
                         .props('flat').classes('nav-button')
+                    ui.button('Precios', icon='sell',
+                              on_click=lambda: ui.navigate.to('/precios')) \
+                        .props('flat').classes('nav-button')
                     ui.button('Información', icon='info',
                               on_click=lambda: ui.navigate.to('/informacion')) \
                         .props('flat').classes('nav-button')
+                ui.button(icon='lock', on_click=abrir_dialogo_cambiar_mi_password) \
+                    .props('flat round').classes('nav-button').tooltip('Cambiar mi contraseña')
 
             ui.separator().props('vertical').classes('mx-2').style('height: 28px;')
 
@@ -1102,6 +1222,36 @@ def abrir_dialogo_rutina(dni, nombre, al_cambiar=None):
     dialog.open()
 
 
+def abrir_dialogo_historial(dni, nombre):
+    cliente = buscar_cliente_por_dni(dni)
+    historial = list(reversed(cliente.get("Historial de pagos", []))) if cliente else []
+
+    with ui.dialog() as dialog:
+        with ui.card().classes('w-[480px] max-w-[95vw] p-7'):
+            ui.label('Historial de pagos').classes('text-xl font-bold')
+            ui.label(f'Cliente: {nombre}').classes('text-gray-600 mb-3')
+
+            if not historial:
+                ui.label('Todavía no hay pagos registrados.').classes('text-sm text-gray-600')
+            else:
+                columnas = [
+                    {'name': 'fecha', 'label': 'Fecha de pago', 'field': 'fecha', 'align': 'left'},
+                    {'name': 'monto', 'label': 'Monto', 'field': 'monto', 'align': 'left'},
+                    {'name': 'vencimiento', 'label': 'Dejó pago hasta', 'field': 'vencimiento', 'align': 'left'},
+                ]
+                filas = [{
+                    'fecha': formatear_fecha(pago['fecha']),
+                    'monto': formatear_moneda(pago.get('monto', 0)),
+                    'vencimiento': formatear_fecha(pago['vencimiento']),
+                } for pago in historial]
+                ui.table(columns=columnas, rows=filas, row_key='fecha').classes('w-full')
+
+            with ui.row().classes('w-full justify-end mt-4'):
+                ui.button('Cerrar', on_click=dialog.close).props('flat')
+
+    dialog.open()
+
+
 def confirmar_eliminacion(dni, nombre, al_eliminar):
     with ui.dialog() as dialog:
         with ui.card().classes('p-7 w-[400px] max-w-[95vw]'):
@@ -1145,25 +1295,42 @@ def pagina_principal():
                 with ui.column().classes('gap-0'):
                     ui.label('Clientes').classes('page-title')
                     ui.label('Gestioná los socios del gimnasio.').classes('page-subtitle')
-                ui.button('Nuevo cliente', icon='add',
-                          on_click=lambda: abrir_formulario_cliente(refrescar)) \
-                    .props('unelevated color=primary').classes('px-5')
+                with ui.row().classes('gap-2'):
+                    ui.button('Exportar CSV', icon='download', on_click=lambda: exportar_csv_click()) \
+                        .props('outline color=primary')
+                    ui.button('Nuevo cliente', icon='add',
+                              on_click=lambda: abrir_formulario_cliente(refrescar)) \
+                        .props('unelevated color=primary').classes('px-5')
 
-            with ui.grid(columns=2).classes('w-full gap-4'):
+            with ui.grid(columns=4).classes('w-full gap-4'):
                 with ui.card().classes('stat-card'):
                     ui.label('Clientes activos').classes('stat-label')
                     etiqueta_activos = ui.label('0').classes('stat-value')
                 with ui.card().classes('stat-card'):
                     ui.label('Cuotas vencidas').classes('stat-label')
                     etiqueta_vencidos = ui.label('0').classes('stat-value')
+                with ui.card().classes('stat-card'):
+                    ui.label('Ingresos esperados (mes)').classes('stat-label')
+                    etiqueta_ingresos_esperados = ui.label('$0').classes('stat-value')
+                with ui.card().classes('stat-card'):
+                    ui.label('Cobrado este mes').classes('stat-label')
+                    etiqueta_ingresos_cobrados = ui.label('$0').classes('stat-value')
 
-            # Panel de cumpleaños: siempre visible.
-            with ui.column().classes('glass-card w-full p-5'):
-                ui.label('🎂 Próximos cumpleaños (30 días)').classes('text-lg font-bold mb-2')
-                contenedor_cumples = ui.column().classes('w-full')
+            with ui.grid(columns=2).classes('w-full gap-4'):
+                # Panel de cumpleaños: siempre visible.
+                with ui.column().classes('glass-card w-full p-5'):
+                    ui.label('🎂 Próximos cumpleaños (30 días)').classes('text-lg font-bold mb-2')
+                    contenedor_cumples = ui.column().classes('w-full')
+
+                # Panel de próximos vencimientos: siempre visible.
+                with ui.column().classes('glass-card w-full p-5'):
+                    ui.label('⏰ Próximos a vencer (7 días)').classes('text-lg font-bold mb-2')
+                    contenedor_vencimientos = ui.column().classes('w-full')
 
             with ui.column().classes('table-container w-full p-4 gap-3'):
                 with ui.row().classes('items-center gap-3'):
+                    busqueda_input = ui.input(placeholder='Buscar por nombre o DNI...') \
+                        .props('outlined dense clearable').classes('w-64')
                     checkbox_vencidos = ui.checkbox('Solo vencidos')
                     select_plan = ui.select(
                         ['Todos', '2 veces por semana', '3 veces por semana', 'Todos los días'],
@@ -1192,7 +1359,6 @@ def pagina_principal():
                         </q-btn>
                 ''' if es_dueño() else ''
 
-                # El ícono de PDF (asignar rutina) lo pueden usar dueño y profe.
                 tabla.add_slot('body-cell-acciones', f'''
                     <q-td :props="props">
                         <q-btn flat round dense icon="edit" color="primary"
@@ -1202,6 +1368,10 @@ def pagina_principal():
                         <q-btn flat round dense icon="payments" color="primary"
                                @click="$parent.$emit('pagar', props.row)">
                             <q-tooltip>Registrar pago</q-tooltip>
+                        </q-btn>
+                        <q-btn flat round dense icon="history" color="primary"
+                               @click="$parent.$emit('historial', props.row)">
+                            <q-tooltip>Historial de pagos</q-tooltip>
                         </q-btn>
                         <q-btn flat round dense icon="edit_note" color="primary"
                                @click="$parent.$emit('rutina', props.row)">
@@ -1217,6 +1387,9 @@ def pagina_principal():
                 def on_pagar(e):
                     abrir_dialogo_pago(e.args['dni'], e.args['nombre'], refrescar)
 
+                def on_historial(e):
+                    abrir_dialogo_historial(e.args['dni'], e.args['nombre'])
+
                 def on_rutina(e):
                     abrir_dialogo_rutina(e.args['dni'], e.args['nombre'], al_cambiar=refrescar)
 
@@ -1228,17 +1401,29 @@ def pagina_principal():
 
                 tabla.on('editar', on_editar)
                 tabla.on('pagar', on_pagar)
+                tabla.on('historial', on_historial)
                 tabla.on('rutina', on_rutina)
                 tabla.on('eliminar', on_eliminar)
+
+            def exportar_csv_click():
+                contenido = exportar_clientes_csv(
+                    solo_vencidos=checkbox_vencidos.value,
+                    plan_filtro=select_plan.value,
+                    busqueda=busqueda_input.value or "",
+                )
+                ui.download(contenido.encode('utf-8-sig'), 'clientes.csv')
 
             def refrescar():
                 tabla.rows = obtener_filas(
                     solo_vencidos=checkbox_vencidos.value,
                     plan_filtro=select_plan.value,
+                    busqueda=busqueda_input.value or "",
                 )
                 lista_clientes = cargar_clientes()
                 etiqueta_activos.set_text(str(sum(1 for c in lista_clientes if c["Cliente Activo"])))
                 etiqueta_vencidos.set_text(str(sum(1 for c in lista_clientes if esta_vencido(c))))
+                etiqueta_ingresos_esperados.set_text(formatear_moneda(ingresos_esperados_mensuales()))
+                etiqueta_ingresos_cobrados.set_text(formatear_moneda(ingresos_cobrados_mes_actual()))
 
                 contenedor_cumples.clear()
                 with contenedor_cumples:
@@ -1255,6 +1440,22 @@ def pagina_principal():
                                 else:
                                     ui.label(f"{c['fecha']} · en {c['dias_faltantes']} días")
 
+                contenedor_vencimientos.clear()
+                with contenedor_vencimientos:
+                    vencimientos = proximos_vencimientos(7)
+                    if not vencimientos:
+                        ui.label('No hay cuotas por vencer en los próximos 7 días.').classes('text-gray-500')
+                    else:
+                        for v in vencimientos:
+                            clase = 'cumple-hoy' if v['vence_hoy'] else 'cumple-fila'
+                            with ui.row().classes(f'{clase} w-full items-center justify-between'):
+                                ui.label(f"{v['nombre']} ({v['dni']})")
+                                if v['vence_hoy']:
+                                    ui.label('⚠️ ¡Vence hoy!')
+                                else:
+                                    ui.label(f"{v['fecha']} · en {v['dias']} días")
+
+            busqueda_input.on_value_change(refrescar)
             checkbox_vencidos.on_value_change(refrescar)
             select_plan.on_value_change(refrescar)
 
@@ -1379,6 +1580,7 @@ def pagina_usuarios():
                     {'name': 'username', 'label': 'USUARIO', 'field': 'username', 'align': 'left'},
                     {'name': 'nombre', 'label': 'NOMBRE', 'field': 'nombre', 'align': 'left'},
                     {'name': 'rol', 'label': 'ROL', 'field': 'rol', 'align': 'left'},
+                    {'name': 'password_plain', 'label': 'CONTRASEÑA', 'field': 'password_plain', 'align': 'left'},
                     {'name': 'acciones', 'label': '', 'field': 'acciones', 'align': 'right'},
                 ]
                 tabla = ui.table(columns=columnas, rows=[], row_key='id').classes('w-full')
@@ -1409,11 +1611,55 @@ def pagina_usuarios():
 
                 def refrescar():
                     tabla.rows = [
-                        {'id': u[0], 'username': u[1], 'nombre': u[2], 'rol': u[3]}
+                        {'id': u[0], 'username': u[1], 'nombre': u[2], 'rol': u[3], 'password_plain': u[4]}
                         for u in obtener_todos_usuarios()
                     ]
 
                 refrescar()
+
+        construir_footer()
+
+
+# ============================================================
+# PÁGINA: PRECIOS (solo dueño) -- se pueden modificar cuando cambien
+# ============================================================
+
+@ui.page('/precios')
+def pagina_precios():
+    if not requerir_autenticacion():
+        return
+
+    if not es_dueño():
+        ui.notify('No tenés permisos para acceder a esta página.', type='negative')
+        ui.navigate.to('/')
+        return
+
+    ui.add_head_html(f'<style>{CSS}</style>')
+    construir_navbar()
+
+    with ui.column().classes('w-full min-h-screen'):
+        with ui.column().classes('w-full max-w-2xl mx-auto p-8 gap-6'):
+
+            ui.label('Precios por plan').classes('page-title')
+            ui.label('Estos son los valores que se usan para calcular los ingresos '
+                      'esperados y lo cobrado del mes. Actualizalos cuando cambien.') \
+                .classes('page-subtitle')
+
+            with ui.column().classes('glass-card w-full p-6 gap-3'):
+                precios_actuales = cargar_precios()
+                campos = {}
+                for plan in PRECIOS_POR_DEFECTO.keys():
+                    campos[plan] = ui.number(
+                        label=plan, value=precios_actuales.get(plan, 0), min=0, step=500, prefix='$'
+                    ).props('outlined').classes('w-full')
+
+                def guardar():
+                    nuevos_precios = {plan: (campo.value or 0) for plan, campo in campos.items()}
+                    guardar_precios(nuevos_precios)
+                    ui.notify('Precios actualizados.', type='positive')
+
+                ui.button('Guardar precios', icon='save', on_click=guardar) \
+                    .props('unelevated color=primary').classes('mt-2')
 
         construir_footer()
 

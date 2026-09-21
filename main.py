@@ -1,3 +1,28 @@
+"""Gestor de Gimnasio Vida Fitness.
+
+Aplicación web (NiceGUI) para administrar los socios de un gimnasio:
+altas, bajas, pagos, precios por plan, rutinas de entrenamiento y un
+portal propio para que cada cliente consulte su situación.
+
+Tiene tres formas de ingresar:
+    - Dueño: control total (clientes, usuarios, precios, información
+      general para los clientes).
+    - Profe: gestiona clientes (alta, edición, pagos, rutinas), pero
+      no puede eliminar clientes ni administrar cuentas de usuario.
+    - Cliente: entra solo con su DNI y ve únicamente su propia ficha
+      (vencimiento, rutina, información del gimnasio).
+
+Los datos se guardan en archivos locales, sin depender de un motor
+de base de datos externo:
+    - usuarios.db      (SQLite)  -> cuentas de dueño y profe.
+    - Clientes.json    (JSON)    -> ficha de cada socio.
+    - precios.json     (JSON)    -> precio vigente de cada plan.
+    - informacion.json (JSON)    -> texto que ven los clientes.
+
+Se ejecuta con: python gimnasio_completo.py
+Requiere: pip install nicegui
+"""
+
 from nicegui import app, ui
 import sqlite3
 import hashlib
@@ -6,6 +31,8 @@ import json
 import os
 import csv
 import io
+import tempfile
+import threading
 from urllib.parse import quote
 from datetime import date, timedelta, datetime
 
@@ -47,24 +74,65 @@ PRECIOS_POR_DEFECTO = {
 }
 
 
+# ============================================================
+# UTILIDADES DE ARCHIVO (lectura tolerante a fallos + escritura
+# atómica), para que un archivo corrupto o a medio escribir no
+# tire abajo toda la aplicación.
+# ============================================================
+
+def _leer_json_seguro(ruta, valor_por_defecto):
+    """Lee un archivo JSON y lo devuelve ya interpretado.
+
+    Si el archivo no existe, o existe pero quedó corrupto (por
+    ejemplo, por un corte de luz a mitad de una escritura anterior),
+    devuelve 'valor_por_defecto' en vez de romper el programa.
+    """
+    if not os.path.exists(ruta):
+        return valor_por_defecto
+    try:
+        with open(ruta, "r", encoding="utf-8") as archivo:
+            return json.load(archivo)
+    except (json.JSONDecodeError, OSError):
+        return valor_por_defecto
+
+
+def _escribir_json_atomico(ruta, datos):
+    """Escribe un archivo JSON de forma atómica.
+
+    En vez de escribir directo sobre 'ruta', escribe primero en un
+    archivo temporal en la misma carpeta y recién al final lo
+    renombra sobre el destino. Así, si el proceso se corta a mitad
+    de camino (corte de luz, reinicio del servidor, etc.), el
+    archivo original queda intacto en vez de quedar a medio escribir.
+    """
+    directorio = os.path.dirname(os.path.abspath(ruta)) or "."
+    descriptor, ruta_temporal = tempfile.mkstemp(dir=directorio, suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as archivo:
+            json.dump(datos, archivo, ensure_ascii=False, indent=4)
+        os.replace(ruta_temporal, ruta)
+    except Exception:
+        if os.path.exists(ruta_temporal):
+            os.remove(ruta_temporal)
+        raise
+
+
 def cargar_precios():
     """Devuelve el diccionario {plan: precio}. Si el archivo no existe
     todavía, o le falta algún plan (por ejemplo, la primera vez que
     corre esta versión), se completa con los valores por defecto."""
     precios = dict(PRECIOS_POR_DEFECTO)
-    if os.path.exists(ARCHIVO_PRECIOS):
-        with open(ARCHIVO_PRECIOS, "r", encoding="utf-8") as archivo:
-            guardados = json.load(archivo)
-            precios.update(guardados)
+    precios.update(_leer_json_seguro(ARCHIVO_PRECIOS, {}))
     return precios
 
 
 def guardar_precios(precios):
-    with open(ARCHIVO_PRECIOS, "w", encoding="utf-8") as archivo:
-        json.dump(precios, archivo, ensure_ascii=False, indent=4)
+    """Guarda el diccionario completo {plan: precio} en precios.json."""
+    _escribir_json_atomico(ARCHIVO_PRECIOS, precios)
 
 
 def precio_de_plan(plan):
+    """Devuelve el precio vigente de un plan puntual."""
     return cargar_precios().get(plan, 0)
 
 
@@ -73,10 +141,18 @@ def precio_de_plan(plan):
 # ============================================================
 
 def conectar_db():
-    return sqlite3.connect(DB_USUARIOS)
+    """Abre una conexión nueva a la base de datos SQLite de usuarios.
+
+    'timeout=10' hace que, si dos operaciones intentan escribir al
+    mismo tiempo, la segunda espere hasta 10 segundos en vez de
+    fallar de inmediato con 'database is locked'."""
+    return sqlite3.connect(DB_USUARIOS, timeout=10)
 
 
 def inicializar_db():
+    """Crea la tabla 'usuarios' si todavía no existe, aplica las
+    migraciones de columnas que falten (versiones anteriores del
+    programa) y garantiza que exista la cuenta del dueño."""
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("""
@@ -107,6 +183,11 @@ def inicializar_db():
 
 
 def hash_password(password, salt=None):
+    """Genera el hash SHA-256 de una contraseña combinada con un salt.
+
+    Si no se pasa 'salt', genera uno nuevo aleatorio (alta de
+    cuenta). Si se pasa uno existente, permite recalcular el mismo
+    hash para compararlo contra el guardado (login)."""
     if salt is None:
         salt = secrets.token_hex(16)
     hash_val = hashlib.sha256((salt + password).encode('utf-8')).hexdigest()
@@ -114,11 +195,13 @@ def hash_password(password, salt=None):
 
 
 def verificar_password(password, salt, hash_val):
+    """Compara una contraseña ingresada contra el hash guardado, recalculándolo con el mismo salt."""
     _, nuevo_hash = hash_password(password, salt)
     return nuevo_hash == hash_val
 
 
 def crear_usuario_dueño():
+    """Crea la cuenta del dueño ('admin' / 'admin123') la primera vez que se ejecuta el programa, si la tabla de usuarios está vacía."""
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM usuarios")
@@ -134,6 +217,7 @@ def crear_usuario_dueño():
 
 
 def obtener_usuario(username):
+    """Busca un usuario por su nombre de usuario. Devuelve la fila completa, o None si no existe."""
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -147,6 +231,7 @@ def obtener_usuario(username):
 
 
 def obtener_usuario_por_id(user_id):
+    """Busca un usuario por su id numérico. Devuelve la fila completa, o None si no existe."""
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -160,6 +245,7 @@ def obtener_usuario_por_id(user_id):
 
 
 def obtener_todos_usuarios():
+    """Devuelve todos los usuarios registrados, ordenados por rol y nombre, para la página de Usuarios."""
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -171,6 +257,7 @@ def obtener_todos_usuarios():
 
 
 def crear_usuario(username, password, nombre, rol):
+    """Da de alta una cuenta nueva (dueño o profe), guardando el hash de la contraseña y también una copia en texto plano para que el dueño pueda consultarla."""
     conn = conectar_db()
     cursor = conn.cursor()
     salt, hash_val = hash_password(password)
@@ -184,6 +271,10 @@ def crear_usuario(username, password, nombre, rol):
 
 
 def actualizar_usuario(user_id, username, nombre, rol, nueva_password=None):
+    """Actualiza los datos de una cuenta existente.
+
+    Si se pasa 'nueva_password', también actualiza el hash y la
+    copia en texto plano; si no, la contraseña queda sin cambios."""
     conn = conectar_db()
     cursor = conn.cursor()
     if nueva_password:
@@ -203,6 +294,7 @@ def actualizar_usuario(user_id, username, nombre, rol, nueva_password=None):
 
 
 def eliminar_usuario(user_id):
+    """Borra una cuenta de usuario, identificándola por su id."""
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM usuarios WHERE id = ?", (user_id,))
@@ -215,26 +307,32 @@ def eliminar_usuario(user_id):
 # login por DNI (ver pagina_login) y se guarda solo en app.storage.user.
 
 def verificar_autenticacion():
+    """Indica si hay una sesión activa (dueño, profe o cliente) en este navegador."""
     return 'rol' in app.storage.user
 
 
 def rol_actual():
+    """Devuelve el rol de la sesión activa ('dueño', 'profe' o 'cliente'), o None si no hay sesión."""
     return app.storage.user.get('rol')
 
 
 def dni_actual():
+    """Devuelve el DNI guardado en la sesión cuando el rol activo es 'cliente'."""
     return app.storage.user.get('dni')
 
 
 def es_dueño():
+    """Indica si la sesión activa corresponde al rol 'dueño'."""
     return rol_actual() == 'dueño'
 
 
 def es_cliente_rol():
+    """Indica si la sesión activa corresponde al rol 'cliente'."""
     return rol_actual() == 'cliente'
 
 
 def requerir_autenticacion():
+    """Redirige a /login si no hay sesión activa. Se llama al principio de cada página que exige estar logueado."""
     if not verificar_autenticacion():
         ui.navigate.to('/login')
         return False
@@ -242,6 +340,7 @@ def requerir_autenticacion():
 
 
 def cerrar_sesion():
+    """Borra los datos de la sesión activa y vuelve a la pantalla de login."""
     app.storage.user.clear()
     ui.notify('Sesión cerrada', type='info')
     ui.navigate.to('/login')
@@ -251,23 +350,30 @@ def cerrar_sesion():
 # DATOS DE CLIENTES (JSON)
 # ============================================================
 
+# Protege las secuencias "leer todo -> modificar -> guardar todo"
+# sobre Clientes.json para que dos acciones simultáneas (por ejemplo,
+# el dueño y un profe registrando pagos al mismo tiempo, desde
+# pestañas distintas) no se pisen una a la otra.
+_lock_clientes = threading.Lock()
+
+
 def cargar_clientes():
-    if os.path.exists(ARCHIVO_CLIENTES):
-        with open(ARCHIVO_CLIENTES, "r", encoding="utf-8") as archivo:
-            return json.load(archivo)
-    return []
+    """Lee y devuelve la lista completa de clientes desde Clientes.json (lista vacía si el archivo no existe o está corrupto)."""
+    return _leer_json_seguro(ARCHIVO_CLIENTES, [])
 
 
 def guardar_clientes(lista_clientes):
-    with open(ARCHIVO_CLIENTES, "w", encoding="utf-8") as archivo:
-        json.dump(lista_clientes, archivo, ensure_ascii=False, indent=4)
+    """Escribe la lista completa de clientes en Clientes.json, reemplazando el contenido anterior."""
+    _escribir_json_atomico(ARCHIVO_CLIENTES, lista_clientes)
 
 
 def dni_existe(lista_clientes, dni):
+    """Indica si ya hay un cliente con ese DNI en la lista dada."""
     return any(cliente["DNI"] == dni for cliente in lista_clientes)
 
 
 def buscar_cliente_por_dni(dni):
+    """Busca y devuelve el cliente con ese DNI, o None si no existe."""
     for cliente in cargar_clientes():
         if cliente["DNI"] == dni:
             return cliente
@@ -275,6 +381,7 @@ def buscar_cliente_por_dni(dni):
 
 
 def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
+    """Arma el diccionario de un cliente nuevo, con el vencimiento a 30 días y el primer registro en su historial de pagos."""
     hoy = date.today()
     precio_inicial = precio_de_plan(plan)
     return {
@@ -294,79 +401,119 @@ def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
     }
 
 
+def agregar_cliente(nuevo_cliente):
+    """Agrega un cliente nuevo a Clientes.json, si su DNI no está ya usado.
+
+    Chequea la duplicación y guarda dentro de la misma sección
+    protegida (_lock_clientes) para que dos altas simultáneas con
+    el mismo DNI no puedan colarse las dos a la vez.
+
+    Devuelve True si se agregó, o False si el DNI ya existía.
+    """
+    with _lock_clientes:
+        lista_clientes = cargar_clientes()
+        if dni_existe(lista_clientes, nuevo_cliente["DNI"]):
+            return False
+        lista_clientes.append(nuevo_cliente)
+        guardar_clientes(lista_clientes)
+        return True
+
+
 def actualizar_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
-    lista_clientes = cargar_clientes()
-    for cliente in lista_clientes:
-        if cliente["DNI"] == dni:
-            cliente["Nombre y  Apellido"] = nombre_y_apellido
-            cliente["Telefono"] = telefono
-            cliente["Plan"] = plan
-            cliente["Fecha de nacimiento"] = fecha_nacimiento
-            guardar_clientes(lista_clientes)
-            return True
-    return False
+    """Modifica los datos editables de un cliente (nombre, teléfono, plan, fecha de nacimiento). El DNI y las fechas de pago no se tocan acá."""
+    with _lock_clientes:
+        lista_clientes = cargar_clientes()
+        for cliente in lista_clientes:
+            if cliente["DNI"] == dni:
+                cliente["Nombre y  Apellido"] = nombre_y_apellido
+                cliente["Telefono"] = telefono
+                cliente["Plan"] = plan
+                cliente["Fecha de nacimiento"] = fecha_nacimiento
+                guardar_clientes(lista_clientes)
+                return True
+        return False
 
 
 def registrar_pago(dni, nueva_fecha_vencimiento):
-    lista_clientes = cargar_clientes()
-    for cliente in lista_clientes:
-        if cliente["DNI"] == dni:
-            monto = precio_de_plan(cliente["Plan"])
-            cliente["Fecha ultimo pago"] = str(date.today())
-            cliente["Fecha de vencimiento"] = nueva_fecha_vencimiento
-            cliente["Cliente Activo"] = True
-            cliente.setdefault("Historial de pagos", []).append({
-                "fecha": str(date.today()),
-                "monto": monto,
-                "vencimiento": nueva_fecha_vencimiento,
-            })
-            guardar_clientes(lista_clientes)
-            return True
-    return False
+    """Registra un pago de un cliente.
+
+    Actualiza la fecha de último pago y el nuevo vencimiento,
+    reactiva al cliente si estaba inactivo, y agrega la entrada
+    correspondiente a su historial de pagos."""
+    with _lock_clientes:
+        lista_clientes = cargar_clientes()
+        for cliente in lista_clientes:
+            if cliente["DNI"] == dni:
+                monto = precio_de_plan(cliente["Plan"])
+                cliente["Fecha ultimo pago"] = str(date.today())
+                cliente["Fecha de vencimiento"] = nueva_fecha_vencimiento
+                cliente["Cliente Activo"] = True
+                cliente.setdefault("Historial de pagos", []).append({
+                    "fecha": str(date.today()),
+                    "monto": monto,
+                    "vencimiento": nueva_fecha_vencimiento,
+                })
+                guardar_clientes(lista_clientes)
+                return True
+        return False
 
 
 def eliminar_cliente(dni):
-    lista_clientes = cargar_clientes()
-    for cliente in lista_clientes:
-        if cliente["DNI"] == dni:
-            lista_clientes.remove(cliente)
-            guardar_clientes(lista_clientes)
-            return True
-    return False
+    """Elimina un cliente de la lista, identificándolo por su DNI."""
+    with _lock_clientes:
+        lista_clientes = cargar_clientes()
+        for cliente in lista_clientes:
+            if cliente["DNI"] == dni:
+                lista_clientes.remove(cliente)
+                guardar_clientes(lista_clientes)
+                return True
+        return False
 
 
-def dar_baja_automatica():
-    lista_clientes = cargar_clientes()
-    cambios = False
-    for cliente in lista_clientes:
-        fecha_ultimo_pago = datetime.strptime(cliente["Fecha ultimo pago"], "%Y-%m-%d").date()
-        if (date.today() - fecha_ultimo_pago).days > 90 and cliente["Cliente Activo"]:
-            cliente["Cliente Activo"] = False
-            cambios = True
-    if cambios:
-        guardar_clientes(lista_clientes)
+def _parsear_fecha(texto):
+    """Convierte un texto 'AAAA-MM-DD' a un objeto date.
+
+    Devuelve None si el texto viene vacío, ausente o mal formado,
+    en vez de romper el programa -- así un dato corrupto en un
+    cliente no tira abajo toda la tabla ni el resto de la página.
+    """
+    if not texto:
+        return None
+    try:
+        return datetime.strptime(texto, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
 
 
 def formatear_fecha(fecha_texto):
-    return datetime.strptime(fecha_texto, "%Y-%m-%d").date().strftime("%d/%m/%Y")
+    """Convierte una fecha guardada como texto ('AAAA-MM-DD') al formato argentino ('DD/MM/AAAA') para mostrarla en pantalla."""
+    fecha = _parsear_fecha(fecha_texto)
+    return fecha.strftime("%d/%m/%Y") if fecha else "(sin fecha)"
 
 
 def formatear_moneda(monto):
+    """Da formato de moneda a un monto: '$' adelante y punto como separador de miles."""
     return "$" + f"{monto:,.0f}".replace(",", ".")
 
 
 def esta_vencido(cliente):
-    fecha_vencimiento = datetime.strptime(cliente["Fecha de vencimiento"], "%Y-%m-%d").date()
+    """Indica si la fecha de vencimiento de un cliente ya pasó respecto a hoy."""
+    fecha_vencimiento = _parsear_fecha(cliente.get("Fecha de vencimiento"))
+    if fecha_vencimiento is None:
+        return False
     return fecha_vencimiento < date.today()
 
 
 def dias_para_vencimiento(cliente):
     """Positivo: días que faltan para vencer. Negativo: días desde que venció."""
-    fecha_vencimiento = datetime.strptime(cliente["Fecha de vencimiento"], "%Y-%m-%d").date()
+    fecha_vencimiento = _parsear_fecha(cliente.get("Fecha de vencimiento"))
+    if fecha_vencimiento is None:
+        return 0
     return (fecha_vencimiento - date.today()).days
 
 
 def _coincide_busqueda(cliente, busqueda):
+    """Indica si el DNI o el nombre del cliente contienen el texto buscado, sin distinguir mayúsculas de minúsculas. Función auxiliar de filtrar_clientes()."""
     if not busqueda:
         return True
     busqueda = busqueda.strip().lower()
@@ -392,6 +539,7 @@ def filtrar_clientes(solo_vencidos=False, plan_filtro="Todos", busqueda=""):
 
 
 def obtener_filas(solo_vencidos=False, plan_filtro="Todos", busqueda=""):
+    """Arma las filas ya formateadas para la tabla de clientes, a partir de los que cumplen los filtros dados."""
     filas = []
     for cliente in filtrar_clientes(solo_vencidos, plan_filtro, busqueda):
         filas.append({
@@ -439,8 +587,8 @@ def ingresos_cobrados_mes_actual():
     total = 0
     for cliente in cargar_clientes():
         for pago in cliente.get("Historial de pagos", []):
-            fecha_pago = datetime.strptime(pago["fecha"], "%Y-%m-%d").date()
-            if fecha_pago.year == hoy.year and fecha_pago.month == hoy.month:
+            fecha_pago = _parsear_fecha(pago.get("fecha"))
+            if fecha_pago and fecha_pago.year == hoy.year and fecha_pago.month == hoy.month:
                 total += pago.get("monto", 0)
     return total
 
@@ -474,15 +622,20 @@ def exportar_clientes_csv(solo_vencidos=False, plan_filtro="Todos", busqueda="")
 
 
 def proximos_cumpleanos(dias_rango=30):
+    """Calcula el próximo cumpleaños de cada cliente y devuelve los
+    cercanos.
+
+    Para cada cliente con fecha de nacimiento, compara solo mes y
+    día (sin importar el año en que nació) contra la fecha de hoy,
+    y devuelve los que caen dentro de 'dias_rango', ordenados del
+    más próximo al más lejano."""
     hoy = date.today()
     resultados = []
 
     for cliente in cargar_clientes():
-        fecha_nac_texto = cliente.get("Fecha de nacimiento")
-        if not fecha_nac_texto:
+        fecha_nac = _parsear_fecha(cliente.get("Fecha de nacimiento"))
+        if fecha_nac is None:
             continue
-
-        fecha_nac = datetime.strptime(fecha_nac_texto, "%Y-%m-%d").date()
 
         try:
             proximo = fecha_nac.replace(year=hoy.year)
@@ -514,13 +667,15 @@ def proximos_cumpleanos(dias_rango=30):
 # ============================================================
 
 def actualizar_rutina(dni, texto_rutina):
-    lista_clientes = cargar_clientes()
-    for cliente in lista_clientes:
-        if cliente["DNI"] == dni:
-            cliente["Rutina"] = texto_rutina
-            guardar_clientes(lista_clientes)
-            return True
-    return False
+    """Guarda (o reemplaza) el texto de la rutina de un cliente puntual."""
+    with _lock_clientes:
+        lista_clientes = cargar_clientes()
+        for cliente in lista_clientes:
+            if cliente["DNI"] == dni:
+                cliente["Rutina"] = texto_rutina
+                guardar_clientes(lista_clientes)
+                return True
+        return False
 
 
 # ============================================================
@@ -530,16 +685,13 @@ def actualizar_rutina(dni, texto_rutina):
 def cargar_informacion():
     """Texto que ven los clientes en 'Información importante'. Si
     todavía no se guardó nada, usa el texto por defecto."""
-    if os.path.exists(ARCHIVO_INFORMACION):
-        with open(ARCHIVO_INFORMACION, "r", encoding="utf-8") as archivo:
-            datos = json.load(archivo)
-            return datos.get("texto", INFO_IMPORTANTE_POR_DEFECTO)
-    return INFO_IMPORTANTE_POR_DEFECTO
+    datos = _leer_json_seguro(ARCHIVO_INFORMACION, {})
+    return datos.get("texto", INFO_IMPORTANTE_POR_DEFECTO)
 
 
 def guardar_informacion(texto):
-    with open(ARCHIVO_INFORMACION, "w", encoding="utf-8") as archivo:
-        json.dump({"texto": texto}, archivo, ensure_ascii=False, indent=4)
+    """Guarda el texto de 'Información importante' que después leen los clientes en su portal."""
+    _escribir_json_atomico(ARCHIVO_INFORMACION, {"texto": texto})
 
 
 # ============================================================
@@ -797,6 +949,7 @@ def abrir_dialogo_cambiar_mi_password():
 
 
 def construir_navbar():
+    """Dibuja la barra superior de navegación, con las opciones que corresponden según el rol de la sesión activa."""
     with ui.header().classes('app-header px-6'):
         with ui.row().classes('w-full items-center'):
             with ui.row().classes('logo-container'):
@@ -839,6 +992,7 @@ def construir_navbar():
 
 
 def construir_footer():
+    """Dibuja el pie de página, igual en todas las pantallas."""
     with ui.element('footer').classes('app-footer'):
         with ui.row().classes('items-center justify-center'):
             ui.label('Gimnasio Vida Fitness · gestor interno').classes('footer-text')
@@ -850,6 +1004,7 @@ def construir_footer():
 
 @ui.page('/login')
 def pagina_login():
+    """Pantalla de inicio de sesión: 'Profesor' (usuario y contraseña, para dueño o profe) o 'Cliente' (solo DNI)."""
     if verificar_autenticacion():
         ui.navigate.to('/mi-cuenta' if es_cliente_rol() else '/')
         return
@@ -984,6 +1139,11 @@ def pagina_login():
 
 @ui.page('/mi-cuenta')
 def pagina_mi_cuenta():
+    """Portal del cliente.
+
+    Muestra el saludo, el vencimiento con los días restantes, el
+    botón de consulta por WhatsApp, sus datos, la información
+    importante del gimnasio y su rutina."""
     if not requerir_autenticacion():
         return
 
@@ -1066,6 +1226,7 @@ def pagina_mi_cuenta():
 # ============================================================
 
 def abrir_formulario_cliente(al_guardar):
+    """Diálogo para dar de alta un cliente nuevo."""
     with ui.dialog() as dialog:
         with ui.card().classes('w-[480px] max-w-[95vw] p-7'):
             ui.label('Nuevo cliente').classes('text-2xl font-bold')
@@ -1085,25 +1246,27 @@ def abrir_formulario_cliente(al_guardar):
                 ui.button('Cancelar', on_click=dialog.close).props('flat')
 
                 def guardar():
-                    if len(dni.value.strip()) != 8:
-                        ui.notify('El DNI debe tener 8 caracteres.', type='negative')
+                    dni_ingresado = dni.value.strip()
+                    telefono_ingresado = telefono.value.strip()
+
+                    if len(dni_ingresado) != 8 or not dni_ingresado.isdigit():
+                        ui.notify('El DNI debe tener 8 dígitos numéricos.', type='negative')
                         return
-                    if len(telefono.value.strip()) != 10:
-                        ui.notify('El teléfono debe tener 10 caracteres.', type='negative')
+                    if len(telefono_ingresado) != 10 or not telefono_ingresado.isdigit():
+                        ui.notify('El teléfono debe tener 10 dígitos numéricos.', type='negative')
                         return
                     if not nacimiento.value:
                         ui.notify('Elegí la fecha de nacimiento.', type='negative')
                         return
-                    if dni_existe(cargar_clientes(), dni.value.strip()):
+
+                    nuevo_cliente = crear_cliente(
+                        dni_ingresado, nombre.value.strip(),
+                        telefono_ingresado, plan.value, nacimiento.value
+                    )
+                    if not agregar_cliente(nuevo_cliente):
                         ui.notify('Este DNI ya está registrado.', type='negative')
                         return
 
-                    lista_clientes = cargar_clientes()
-                    lista_clientes.append(
-                        crear_cliente(dni.value.strip(), nombre.value.strip(),
-                                      telefono.value.strip(), plan.value, nacimiento.value)
-                    )
-                    guardar_clientes(lista_clientes)
                     ui.notify('Cliente agregado correctamente.', type='positive')
                     dialog.close()
                     al_guardar()
@@ -1114,6 +1277,7 @@ def abrir_formulario_cliente(al_guardar):
 
 
 def abrir_formulario_editar_cliente(dni_original, al_guardar):
+    """Diálogo para editar los datos de un cliente existente (el DNI no se puede cambiar)."""
     cliente = buscar_cliente_por_dni(dni_original)
     if cliente is None:
         ui.notify('No se encontró el cliente.', type='negative')
@@ -1140,15 +1304,16 @@ def abrir_formulario_editar_cliente(dni_original, al_guardar):
                 ui.button('Cancelar', on_click=dialog.close).props('flat')
 
                 def guardar():
-                    if len(telefono.value.strip()) != 10:
-                        ui.notify('El teléfono debe tener 10 caracteres.', type='negative')
+                    telefono_ingresado = telefono.value.strip()
+                    if len(telefono_ingresado) != 10 or not telefono_ingresado.isdigit():
+                        ui.notify('El teléfono debe tener 10 dígitos numéricos.', type='negative')
                         return
                     if not nacimiento.value:
                         ui.notify('Elegí la fecha de nacimiento.', type='negative')
                         return
 
                     actualizar_cliente(dni_original, nombre.value.strip(),
-                                       telefono.value.strip(), plan.value, nacimiento.value)
+                                       telefono_ingresado, plan.value, nacimiento.value)
                     ui.notify('Cliente actualizado.', type='positive')
                     dialog.close()
                     al_guardar()
@@ -1159,6 +1324,7 @@ def abrir_formulario_editar_cliente(dni_original, al_guardar):
 
 
 def abrir_dialogo_pago(dni, nombre, al_registrar):
+    """Diálogo para registrar un pago, eligiendo con un calendario hasta qué fecha queda cubierta la cuota."""
     with ui.dialog() as dialog:
         with ui.card().classes('w-[400px] max-w-[95vw] p-7'):
             ui.label('Registrar pago').classes('text-xl font-bold')
@@ -1223,6 +1389,7 @@ def abrir_dialogo_rutina(dni, nombre, al_cambiar=None):
 
 
 def abrir_dialogo_historial(dni, nombre):
+    """Diálogo de solo lectura con todos los pagos registrados de un cliente, del más reciente al más viejo."""
     cliente = buscar_cliente_por_dni(dni)
     historial = list(reversed(cliente.get("Historial de pagos", []))) if cliente else []
 
@@ -1253,6 +1420,7 @@ def abrir_dialogo_historial(dni, nombre):
 
 
 def confirmar_eliminacion(dni, nombre, al_eliminar):
+    """Diálogo de confirmación antes de eliminar un cliente."""
     with ui.dialog() as dialog:
         with ui.card().classes('p-7 w-[400px] max-w-[95vw]'):
             ui.label('Eliminar cliente').classes('text-xl font-bold')
@@ -1277,6 +1445,12 @@ def confirmar_eliminacion(dni, nombre, al_eliminar):
 
 @ui.page('/')
 def pagina_principal():
+    """Página de Clientes, para dueño y profe.
+
+    Incluye las estadísticas del mes, los paneles de próximos
+    cumpleaños y próximos vencimientos, el buscador, los filtros,
+    la exportación a CSV y la tabla con todas las acciones sobre
+    cada cliente."""
     if not requerir_autenticacion():
         return
 
@@ -1284,7 +1458,6 @@ def pagina_principal():
         ui.navigate.to('/mi-cuenta')
         return
 
-    dar_baja_automatica()
     ui.add_head_html(f'<style>{CSS}</style>')
     construir_navbar()
 
@@ -1469,6 +1642,7 @@ def pagina_principal():
 # ============================================================
 
 def abrir_formulario_usuario(al_guardar):
+    """Diálogo para crear una cuenta nueva de dueño o profe."""
     with ui.dialog() as dialog:
         with ui.card().classes('w-[480px] max-w-[95vw] p-7'):
             ui.label('Nuevo usuario').classes('text-2xl font-bold mb-2')
@@ -1505,6 +1679,7 @@ def abrir_formulario_usuario(al_guardar):
 
 
 def abrir_formulario_editar_usuario(user_id, al_guardar):
+    """Diálogo para editar una cuenta existente, incluyendo un cambio de contraseña opcional."""
     usuario = obtener_usuario_por_id(user_id)
     if usuario is None:
         ui.notify('No se encontró el usuario.', type='negative')
@@ -1553,6 +1728,7 @@ def abrir_formulario_editar_usuario(user_id, al_guardar):
 
 @ui.page('/usuarios')
 def pagina_usuarios():
+    """Página de administración de cuentas (solo dueño): alta, edición y borrado de usuarios."""
     if not requerir_autenticacion():
         return
 
@@ -1626,6 +1802,7 @@ def pagina_usuarios():
 
 @ui.page('/precios')
 def pagina_precios():
+    """Página para editar el precio de cada plan (solo dueño)."""
     if not requerir_autenticacion():
         return
 
@@ -1670,6 +1847,7 @@ def pagina_precios():
 
 @ui.page('/informacion')
 def pagina_informacion():
+    """Página para editar el texto de 'Información importante' que ven los clientes (solo dueño)."""
     if not requerir_autenticacion():
         return
 
@@ -1717,7 +1895,15 @@ ui.run(
     storage_secret='gimnasio_vida_fitness_secret',
 )
 
+# Si la variable de entorno PORT viene con un valor que no es un
+# número (por ejemplo, mal configurada en el panel del hosting),
+# usamos 8080 en vez de que el programa se caiga al arrancar.
+try:
+    _puerto = int(os.environ.get('PORT', 8080))
+except (TypeError, ValueError):
+    _puerto = 8080
+
 ui.run(
     host='0.0.0.0',
-    port=int(os.environ.get('PORT', 8080)),
+    port=_puerto,
 )

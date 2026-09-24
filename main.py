@@ -49,7 +49,10 @@ ROLES = ['dueño', 'profe']  # el rol 'cliente' no vive en esta tabla: se entra 
 # Número de WhatsApp del gimnasio para el botón de consultas del cliente.
 # Formato: código de país + número, SIN el "+", sin espacios ni guiones.
 # Ejemplo Argentina, Mendoza, celular 261 555-1234 -> "5492615551234"
-NUMERO_WHATSAPP_GIMNASIO = "5492634847749"  # <-- reemplazar por el número real
+NUMERO_WHATSAPP_GIMNASIO = "5492634847749"
+
+# Encuesta anónima de satisfacción / propuestas de mejora.
+LINK_ENCUESTA = "https://qr-feedback-collector.web.app?location=1774472795678"
 
 ARCHIVO_INFORMACION = 'informacion.json'
 
@@ -381,9 +384,12 @@ def buscar_cliente_por_dni(dni):
 
 
 def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
-    """Arma el diccionario de un cliente nuevo, con el vencimiento a 30 días y el primer registro en su historial de pagos."""
+    """Arma el diccionario de un cliente nuevo, con el vencimiento a 30
+    días, el primer registro en su historial de pagos, y una
+    contraseña inicial igual a su DNI (que después puede cambiar)."""
     hoy = date.today()
     precio_inicial = precio_de_plan(plan)
+    salt, hash_val = hash_password(dni)
     return {
         "DNI": dni,
         "Nombre y  Apellido": nombre_y_apellido,
@@ -398,7 +404,41 @@ def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
         "Historial de pagos": [
             {"fecha": str(hoy), "monto": precio_inicial, "vencimiento": str(hoy + timedelta(days=30))}
         ],
+        "Password Hash": hash_val,
+        "Password Salt": salt,
+        "Password Plain": dni,
     }
+
+
+def verificar_password_cliente(cliente, password_ingresada):
+    """Verifica la contraseña de un cliente para el login.
+
+    Si la ficha es de un cliente creado antes de esta función (no
+    tiene contraseña guardada todavía), acepta que su DNI funcione
+    como contraseña -- así nadie queda afuera por una ficha vieja.
+    """
+    if "Password Hash" in cliente and "Password Salt" in cliente:
+        return verificar_password(password_ingresada, cliente["Password Salt"], cliente["Password Hash"])
+    return password_ingresada == cliente["DNI"]
+
+
+def cambiar_password_cliente(dni, nueva_password):
+    """Cambia la contraseña de un cliente.
+
+    La usa tanto el propio cliente para cambiar la suya, como el
+    login para completarle la contraseña a una ficha vieja que
+    todavía no tenía una guardada."""
+    with _lock_clientes:
+        lista_clientes = cargar_clientes()
+        for cliente in lista_clientes:
+            if cliente["DNI"] == dni:
+                salt, hash_val = hash_password(nueva_password)
+                cliente["Password Hash"] = hash_val
+                cliente["Password Salt"] = salt
+                cliente["Password Plain"] = nueva_password
+                guardar_clientes(lista_clientes)
+                return True
+        return False
 
 
 def agregar_cliente(nuevo_cliente):
@@ -538,11 +578,16 @@ def filtrar_clientes(solo_vencidos=False, plan_filtro="Todos", busqueda=""):
     return resultado
 
 
-def obtener_filas(solo_vencidos=False, plan_filtro="Todos", busqueda=""):
-    """Arma las filas ya formateadas para la tabla de clientes, a partir de los que cumplen los filtros dados."""
+def obtener_filas(solo_vencidos=False, plan_filtro="Todos", busqueda="", incluir_password=False):
+    """Arma las filas ya formateadas para la tabla de clientes, a
+    partir de los que cumplen los filtros dados.
+
+    'incluir_password' solo lo pone en True la página de Clientes
+    cuando quien mira es el dueño -- así un profe nunca recibe ese
+    dato en la tabla."""
     filas = []
     for cliente in filtrar_clientes(solo_vencidos, plan_filtro, busqueda):
-        filas.append({
+        fila = {
             "dni": cliente["DNI"],
             "nombre": cliente["Nombre y  Apellido"],
             "telefono": cliente["Telefono"],
@@ -551,7 +596,10 @@ def obtener_filas(solo_vencidos=False, plan_filtro="Todos", busqueda=""):
                           if cliente.get("Fecha de nacimiento") else "-",
             "vencimiento": formatear_fecha(cliente["Fecha de vencimiento"]),
             "activo": "Sí" if cliente["Cliente Activo"] else "No",
-        })
+        }
+        if incluir_password:
+            fila["password"] = cliente.get("Password Plain", "(sin definir)")
+        filas.append(fila)
     return filas
 
 
@@ -692,6 +740,47 @@ def cargar_informacion():
 def guardar_informacion(texto):
     """Guarda el texto de 'Información importante' que después leen los clientes en su portal."""
     _escribir_json_atomico(ARCHIVO_INFORMACION, {"texto": texto})
+
+
+# ============================================================
+# ANUNCIOS DEL DUEÑO (los ven los clientes y el personal al entrar)
+# ============================================================
+
+ARCHIVO_ANUNCIOS = 'anuncios.json'
+
+_lock_anuncios = threading.Lock()
+
+
+def cargar_anuncios():
+    """Devuelve la lista de anuncios (más nuevo primero). Cada uno
+    tiene 'id' (para poder borrarlo), 'fecha' y 'texto'."""
+    return _leer_json_seguro(ARCHIVO_ANUNCIOS, [])
+
+
+def guardar_anuncios(lista_anuncios):
+    """Guarda la lista completa de anuncios en anuncios.json."""
+    _escribir_json_atomico(ARCHIVO_ANUNCIOS, lista_anuncios)
+
+
+def agregar_anuncio(texto):
+    """Publica un anuncio nuevo, con la fecha de hoy, al principio de la lista."""
+    with _lock_anuncios:
+        lista_anuncios = cargar_anuncios()
+        nuevo_id = (max((a["id"] for a in lista_anuncios), default=0)) + 1
+        lista_anuncios.insert(0, {
+            "id": nuevo_id,
+            "fecha": str(date.today()),
+            "texto": texto,
+        })
+        guardar_anuncios(lista_anuncios)
+
+
+def eliminar_anuncio(anuncio_id):
+    """Borra un anuncio por su id."""
+    with _lock_anuncios:
+        lista_anuncios = cargar_anuncios()
+        lista_anuncios = [a for a in lista_anuncios if a["id"] != anuncio_id]
+        guardar_anuncios(lista_anuncios)
 
 
 # ============================================================
@@ -889,8 +978,18 @@ body {
 .rutina-cliente {
     background: rgba(59, 130, 246, 0.12); border: 1px solid rgba(37, 99, 235, 0.3);
     border-radius: 14px; padding: 16px 20px; color: #1e3a8a; font-size: 14px; line-height: 1.7;
-    white-space: pre-line;
 }
+.rutina-cliente ul, .rutina-cliente ol { padding-left: 22px; margin: 8px 0; }
+.rutina-cliente p { margin: 6px 0; }
+.rutina-cliente h1, .rutina-cliente h2, .rutina-cliente h3 { margin: 10px 0 6px 0; }
+
+.anuncio-item {
+    background: linear-gradient(135deg, rgba(22, 163, 74, 0.14), rgba(74, 222, 128, 0.10));
+    border: 1px solid rgba(22, 163, 74, 0.35);
+    border-radius: 14px; padding: 14px 18px; margin-bottom: 10px;
+    color: #14532d;
+}
+.anuncio-fecha { font-size: 11px; color: #16803d; font-weight: 700; text-transform: uppercase; }
 
 .btn-whatsapp {
     background: #25D366 !important; color: white !important;
@@ -975,6 +1074,9 @@ def construir_navbar():
                         .props('flat').classes('nav-button')
                     ui.button('Información', icon='info',
                               on_click=lambda: ui.navigate.to('/informacion')) \
+                        .props('flat').classes('nav-button')
+                    ui.button('Anuncios', icon='campaign',
+                              on_click=lambda: ui.navigate.to('/anuncios')) \
                         .props('flat').classes('nav-button')
                 ui.button(icon='lock', on_click=abrir_dialogo_cambiar_mi_password) \
                     .props('flat round').classes('nav-button').tooltip('Cambiar mi contraseña')
@@ -1093,18 +1195,23 @@ def pagina_login():
                 ui.button('Volver', icon='arrow_back', on_click=volver_admin) \
                     .props('flat').classes('w-full mt-2')
 
-            # ---- Formulario Cliente (solo DNI) ----
+            # ---- Formulario Cliente (DNI como usuario y contraseña) ----
             with contenedor_cliente:
                 error_cliente = ui.column().classes('w-full')
-                dni_input = ui.input('Tu DNI').props('outlined').classes('w-full')
+                dni_input = ui.input('Tu DNI (usuario)').props('outlined').classes('w-full')
+                password_cliente_input = ui.input(
+                    'Contraseña', password=True, password_toggle_button=True,
+                    placeholder='La primera vez es tu propio DNI'
+                ).props('outlined').classes('w-full')
 
                 def intentar_login_cliente():
                     error_cliente.clear()
                     dni = dni_input.value.strip()
+                    clave = password_cliente_input.value
 
-                    if not dni:
+                    if not dni or not clave:
                         with error_cliente:
-                            ui.label('Ingresá tu DNI').classes('login-error w-full')
+                            ui.label('Ingresá tu DNI y tu contraseña.').classes('login-error w-full')
                         return
 
                     cliente = buscar_cliente_por_dni(dni)
@@ -1113,6 +1220,17 @@ def pagina_login():
                             ui.label('No encontramos ese DNI. Consultá con recepción.') \
                                 .classes('login-error w-full')
                         return
+
+                    if not verificar_password_cliente(cliente, clave):
+                        with error_cliente:
+                            ui.label('Contraseña incorrecta.').classes('login-error w-full')
+                        return
+
+                    # Ficha vieja sin contraseña guardada todavía (entró con
+                    # su DNI como clave, según permite verificar_password_cliente):
+                    # se la completamos ahora para que quede guardada.
+                    if "Password Hash" not in cliente:
+                        cambiar_password_cliente(dni, dni)
 
                     app.storage.user['rol'] = 'cliente'
                     app.storage.user['dni'] = dni
@@ -1124,6 +1242,7 @@ def pagina_login():
                 ui.button('Ingresar', icon='login', on_click=intentar_login_cliente) \
                     .props('unelevated color=primary').classes('w-full mt-2')
                 dni_input.on('keydown.enter', lambda e: intentar_login_cliente())
+                password_cliente_input.on('keydown.enter', lambda e: intentar_login_cliente())
 
                 def volver_cliente():
                     contenedor_cliente.visible = False
@@ -1137,13 +1256,55 @@ def pagina_login():
 # PÁGINA: MI CUENTA (cliente)
 # ============================================================
 
+def abrir_dialogo_cambiar_password_cliente(dni):
+    """El cliente cambia su propia contraseña (la que usa para entrar con su DNI)."""
+    cliente = buscar_cliente_por_dni(dni)
+    if cliente is None:
+        ui.notify('No se pudo identificar tu cuenta.', type='negative')
+        return
+
+    with ui.dialog() as dialog:
+        with ui.card().classes('w-[420px] max-w-[95vw] p-7'):
+            ui.label('Cambiar mi contraseña').classes('text-xl font-bold mb-3')
+
+            actual = ui.input('Contraseña actual', password=True, password_toggle_button=True) \
+                .props('outlined').classes('w-full')
+            nueva = ui.input('Nueva contraseña', password=True, password_toggle_button=True) \
+                .props('outlined').classes('w-full')
+            confirmar = ui.input('Confirmar nueva contraseña', password=True, password_toggle_button=True) \
+                .props('outlined').classes('w-full')
+
+            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                ui.button('Cancelar', on_click=dialog.close).props('flat')
+
+                def guardar():
+                    cliente_actualizado = buscar_cliente_por_dni(dni)
+                    if not verificar_password_cliente(cliente_actualizado, actual.value):
+                        ui.notify('La contraseña actual no es correcta.', type='negative')
+                        return
+                    if not nueva.value or len(nueva.value) < 4:
+                        ui.notify('La nueva contraseña debe tener al menos 4 caracteres.', type='negative')
+                        return
+                    if nueva.value != confirmar.value:
+                        ui.notify('Las contraseñas nuevas no coinciden.', type='negative')
+                        return
+
+                    cambiar_password_cliente(dni, nueva.value)
+                    ui.notify('Contraseña actualizada correctamente.', type='positive')
+                    dialog.close()
+
+                ui.button('Guardar', icon='save', on_click=guardar).props('unelevated color=primary')
+
+    dialog.open()
+
+
 @ui.page('/mi-cuenta')
 def pagina_mi_cuenta():
     """Portal del cliente.
 
-    Muestra el saludo, el vencimiento con los días restantes, el
-    botón de consulta por WhatsApp, sus datos, la información
-    importante del gimnasio y su rutina."""
+    Muestra el saludo, los anuncios del gimnasio, el vencimiento con
+    los días restantes, los botones de WhatsApp y de la encuesta
+    anónima, sus datos, la información importante y su rutina."""
     if not requerir_autenticacion():
         return
 
@@ -1166,15 +1327,28 @@ def pagina_mi_cuenta():
                 ui.label(f"¡Hola, {cliente['Nombre y  Apellido']}!").classes('page-title')
                 ui.label('Este es tu resumen en el gimnasio.').classes('page-subtitle mb-4')
 
-                # --- Botón de consulta directa por WhatsApp ---
+                # --- Anuncios del gimnasio ---
+                anuncios = cargar_anuncios()
+                if anuncios:
+                    ui.label('📢 Anuncios').classes('text-lg font-bold mb-1')
+                    for anuncio in anuncios[:5]:
+                        with ui.column().classes('anuncio-item w-full'):
+                            ui.label(formatear_fecha(anuncio['fecha'])).classes('anuncio-fecha')
+                            ui.label(anuncio['texto'])
+
+                # --- Botones de consulta: WhatsApp y encuesta anónima ---
                 mensaje = quote(
                     f"Hola! Soy {cliente['Nombre y  Apellido']} (DNI {cliente['DNI']}), "
                     f"quería hacer una consulta."
                 )
                 link_whatsapp = f"https://wa.me/{NUMERO_WHATSAPP_GIMNASIO}?text={mensaje}"
-                ui.button('Consultar por WhatsApp', icon='chat',
-                          on_click=lambda: ui.navigate.to(link_whatsapp, new_tab=True)) \
-                    .props('unelevated').classes('btn-whatsapp w-full mb-4')
+                with ui.row().classes('w-full gap-2 mb-4'):
+                    ui.button('Consultar por WhatsApp', icon='chat',
+                              on_click=lambda: ui.navigate.to(link_whatsapp, new_tab=True)) \
+                        .props('unelevated').classes('btn-whatsapp flex-1')
+                    ui.button('Encuesta / Sugerencias', icon='feedback',
+                              on_click=lambda: ui.navigate.to(LINK_ENCUESTA, new_tab=True)) \
+                        .props('outline color=primary').classes('flex-1')
 
                 # --- Vencimiento y días restantes ---
                 dias = dias_para_vencimiento(cliente)
@@ -1188,7 +1362,12 @@ def pagina_mi_cuenta():
                         ui.label(f"Te quedan {dias} día(s) de cuota vigente.")
 
                 # --- Tus datos ---
-                ui.label('Tus datos').classes('text-lg font-bold mt-2 mb-1')
+                with ui.row().classes('w-full items-center justify-between mt-2 mb-1'):
+                    ui.label('Tus datos').classes('text-lg font-bold')
+                    ui.button('Cambiar mi contraseña', icon='lock',
+                              on_click=lambda: abrir_dialogo_cambiar_password_cliente(dni)) \
+                        .props('flat dense color=primary')
+
                 datos = [
                     ('DNI', cliente['DNI']),
                     ('Teléfono', cliente['Telefono']),
@@ -1214,7 +1393,7 @@ def pagina_mi_cuenta():
                 texto_rutina = cliente.get('Rutina', '').strip()
                 with ui.column().classes('rutina-cliente w-full'):
                     if texto_rutina:
-                        ui.label(texto_rutina)
+                        ui.html(texto_rutina)
                     else:
                         ui.label('Todavía no tenés una rutina cargada. Consultá con tu profe.')
 
@@ -1354,21 +1533,22 @@ def abrir_dialogo_pago(dni, nombre, al_registrar):
 
 def abrir_dialogo_rutina(dni, nombre, al_cambiar=None):
     """El profe o el dueño escriben (o borran) la rutina de un cliente
-    puntual, como texto simple guardado en su ficha (Clientes.json)."""
+    puntual, con formato (negrita, títulos, viñetas), guardada como
+    HTML en su ficha (Clientes.json)."""
     cliente = buscar_cliente_por_dni(dni)
     texto_actual = cliente.get('Rutina', '') if cliente else ''
 
     with ui.dialog() as dialog:
-        with ui.card().classes('w-[520px] max-w-[95vw] p-7'):
+        with ui.card().classes('w-[560px] max-w-[95vw] p-7'):
             ui.label('Rutina de entrenamiento').classes('text-xl font-bold')
             ui.label(f'Cliente: {nombre}').classes('text-gray-600 mb-3')
 
-            area_rutina = ui.textarea(value=texto_actual, placeholder='Escribí acá la rutina...') \
-                .props('outlined rows=8').classes('w-full')
+            editor_rutina = ui.editor(value=texto_actual, placeholder='Escribí acá la rutina...') \
+                .classes('w-full').style('min-height: 220px')
 
             with ui.row().classes('w-full justify-between gap-2 mt-4'):
                 def borrar():
-                    area_rutina.value = ''
+                    editor_rutina.value = ''
 
                 ui.button('Vaciar', icon='delete', on_click=borrar).props('outline color=negative')
 
@@ -1376,7 +1556,7 @@ def abrir_dialogo_rutina(dni, nombre, al_cambiar=None):
                     ui.button('Cerrar', on_click=dialog.close).props('flat')
 
                     def guardar():
-                        actualizar_rutina(dni, area_rutina.value.strip())
+                        actualizar_rutina(dni, editor_rutina.value.strip())
                         ui.notify('Rutina guardada en el perfil del cliente.', type='positive')
                         dialog.close()
                         if al_cambiar:
@@ -1500,6 +1680,16 @@ def pagina_principal():
                     ui.label('⏰ Próximos a vencer (7 días)').classes('text-lg font-bold mb-2')
                     contenedor_vencimientos = ui.column().classes('w-full')
 
+            # Anuncios del dueño: visibles también para el personal.
+            anuncios_actuales = cargar_anuncios()
+            if anuncios_actuales:
+                with ui.column().classes('glass-card w-full p-5'):
+                    ui.label('📢 Anuncios').classes('text-lg font-bold mb-2')
+                    for anuncio in anuncios_actuales[:5]:
+                        with ui.column().classes('anuncio-item w-full'):
+                            ui.label(formatear_fecha(anuncio['fecha'])).classes('anuncio-fecha')
+                            ui.label(anuncio['texto'])
+
             with ui.column().classes('table-container w-full p-4 gap-3'):
                 with ui.row().classes('items-center gap-3'):
                     busqueda_input = ui.input(placeholder='Buscar por nombre o DNI...') \
@@ -1520,8 +1710,12 @@ def pagina_principal():
                     {'name': 'nacimiento', 'label': 'Cumpleaños', 'field': 'nacimiento', 'align': 'left'},
                     {'name': 'vencimiento', 'label': 'Vencimiento', 'field': 'vencimiento', 'align': 'left'},
                     {'name': 'activo', 'label': 'Activo', 'field': 'activo', 'align': 'left'},
-                    {'name': 'acciones', 'label': '', 'field': 'acciones', 'align': 'right'},
                 ]
+                if es_dueño():
+                    columnas.append(
+                        {'name': 'password', 'label': 'Contraseña', 'field': 'password', 'align': 'left'}
+                    )
+                columnas.append({'name': 'acciones', 'label': '', 'field': 'acciones', 'align': 'right'})
 
                 tabla = ui.table(columns=columnas, rows=[], row_key='dni').classes('w-full')
 
@@ -1591,6 +1785,7 @@ def pagina_principal():
                     solo_vencidos=checkbox_vencidos.value,
                     plan_filtro=select_plan.value,
                     busqueda=busqueda_input.value or "",
+                    incluir_password=es_dueño(),
                 )
                 lista_clientes = cargar_clientes()
                 etiqueta_activos.set_text(str(sum(1 for c in lista_clientes if c["Cliente Activo"])))
@@ -1878,6 +2073,78 @@ def pagina_informacion():
 
                 ui.button('Guardar cambios', icon='save', on_click=guardar) \
                     .props('unelevated color=primary').classes('mt-3')
+
+        construir_footer()
+
+
+# ============================================================
+# PÁGINA: ANUNCIOS (solo dueño) -- los ven clientes y personal
+# ============================================================
+
+@ui.page('/anuncios')
+def pagina_anuncios():
+    """Página para publicar y borrar anuncios (solo dueño). Los
+    anuncios se muestran a los clientes en su portal y al personal
+    en la página de Clientes."""
+    if not requerir_autenticacion():
+        return
+
+    if not es_dueño():
+        ui.notify('No tenés permisos para acceder a esta página.', type='negative')
+        ui.navigate.to('/')
+        return
+
+    ui.add_head_html(f'<style>{CSS}</style>')
+    construir_navbar()
+
+    with ui.column().classes('w-full min-h-screen'):
+        with ui.column().classes('w-full max-w-3xl mx-auto p-8 gap-6'):
+
+            ui.label('Anuncios').classes('page-title')
+            ui.label('Lo que publiques acá lo ven los clientes al entrar a su '
+                      'cuenta, y también el personal en la página de Clientes.') \
+                .classes('page-subtitle')
+
+            with ui.column().classes('glass-card w-full p-6'):
+                ui.label('Nuevo anuncio').classes('text-lg font-bold mb-2')
+                texto_nuevo = ui.textarea(placeholder='Escribí el anuncio...') \
+                    .props('outlined rows=3').classes('w-full')
+
+                def publicar():
+                    if not texto_nuevo.value.strip():
+                        ui.notify('Escribí un texto antes de publicar.', type='negative')
+                        return
+                    agregar_anuncio(texto_nuevo.value.strip())
+                    texto_nuevo.value = ''
+                    ui.notify('Anuncio publicado.', type='positive')
+                    refrescar()
+
+                ui.button('Publicar', icon='campaign', on_click=publicar) \
+                    .props('unelevated color=primary').classes('mt-2')
+
+            ui.label('Anuncios publicados').classes('text-lg font-bold mt-4')
+            contenedor_lista = ui.column().classes('w-full')
+
+            def refrescar():
+                contenedor_lista.clear()
+                with contenedor_lista:
+                    anuncios = cargar_anuncios()
+                    if not anuncios:
+                        ui.label('Todavía no publicaste ningún anuncio.').classes('text-gray-500')
+                    for anuncio in anuncios:
+                        with ui.row().classes('anuncio-item w-full items-center justify-between'):
+                            with ui.column().classes('gap-0'):
+                                ui.label(formatear_fecha(anuncio['fecha'])).classes('anuncio-fecha')
+                                ui.label(anuncio['texto'])
+
+                            def eliminar(anuncio_id=anuncio['id']):
+                                eliminar_anuncio(anuncio_id)
+                                ui.notify('Anuncio eliminado.', type='positive')
+                                refrescar()
+
+                            ui.button(icon='delete', on_click=eliminar).props('flat round color=negative')
+
+            refrescar()
 
         construir_footer()
 

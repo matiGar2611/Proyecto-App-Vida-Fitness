@@ -407,6 +407,7 @@ def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
         "Password Hash": hash_val,
         "Password Salt": salt,
         "Password Plain": dni,
+        "Saldo pendiente": 0,
     }
 
 
@@ -474,28 +475,47 @@ def actualizar_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento)
         return False
 
 
-def registrar_pago(dni, nueva_fecha_vencimiento):
-    """Registra un pago de un cliente.
+def registrar_pago(dni, nueva_fecha_vencimiento, monto_abonado):
+    """Registra un pago de un cliente, que puede ser parcial.
 
     Actualiza la fecha de último pago y el nuevo vencimiento,
-    reactiva al cliente si estaba inactivo, y agrega la entrada
-    correspondiente a su historial de pagos."""
+    reactiva al cliente si estaba inactivo, ajusta su saldo
+    pendiente (si pagó menos que el precio del plan, la diferencia
+    queda como deuda), agrega la entrada a su historial de pagos, y
+    registra el ingreso en el libro contable general."""
+    nombre_cliente = None
     with _lock_clientes:
         lista_clientes = cargar_clientes()
         for cliente in lista_clientes:
             if cliente["DNI"] == dni:
-                monto = precio_de_plan(cliente["Plan"])
+                precio_plan = precio_de_plan(cliente["Plan"])
+                deuda_anterior = cliente.get("Saldo pendiente", 0)
+                diferencia = precio_plan - monto_abonado
+                nueva_deuda = max(0, deuda_anterior + diferencia)
+
+                cliente["Saldo pendiente"] = nueva_deuda
                 cliente["Fecha ultimo pago"] = str(date.today())
                 cliente["Fecha de vencimiento"] = nueva_fecha_vencimiento
                 cliente["Cliente Activo"] = True
                 cliente.setdefault("Historial de pagos", []).append({
                     "fecha": str(date.today()),
-                    "monto": monto,
+                    "monto": monto_abonado,
                     "vencimiento": nueva_fecha_vencimiento,
+                    "saldo_pendiente_tras_pago": nueva_deuda,
                 })
                 guardar_clientes(lista_clientes)
-                return True
+                nombre_cliente = cliente["Nombre y  Apellido"]
+                break
+
+    if nombre_cliente is None:
         return False
+
+    registrar_movimiento(
+        "ingreso", "Cuota",
+        f"Pago de cuota - {nombre_cliente} (DNI {dni})",
+        monto_abonado, dni,
+    )
+    return True
 
 
 def eliminar_cliente(dni):
@@ -596,6 +616,7 @@ def obtener_filas(solo_vencidos=False, plan_filtro="Todos", busqueda="", incluir
                           if cliente.get("Fecha de nacimiento") else "-",
             "vencimiento": formatear_fecha(cliente["Fecha de vencimiento"]),
             "activo": "Sí" if cliente["Cliente Activo"] else "No",
+            "debe": formatear_moneda(cliente.get("Saldo pendiente", 0)) if cliente.get("Saldo pendiente", 0) > 0 else "-",
         }
         if incluir_password:
             fila["password"] = cliente.get("Password Plain", "(sin definir)")
@@ -781,6 +802,125 @@ def eliminar_anuncio(anuncio_id):
         lista_anuncios = cargar_anuncios()
         lista_anuncios = [a for a in lista_anuncios if a["id"] != anuncio_id]
         guardar_anuncios(lista_anuncios)
+
+
+# ============================================================
+# CONTABILIDAD (ingresos, egresos y deuda de clientes)
+# ============================================================
+
+ARCHIVO_CONTABILIDAD = 'contabilidad.json'
+
+_lock_contabilidad = threading.Lock()
+
+MESES_ES = [
+    "", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+]
+
+
+def cargar_movimientos():
+    """Devuelve todos los movimientos de contabilidad registrados (cuotas, bebidas, gastos, etc.)."""
+    return _leer_json_seguro(ARCHIVO_CONTABILIDAD, [])
+
+
+def guardar_movimientos(lista_movimientos):
+    """Guarda la lista completa de movimientos en contabilidad.json."""
+    _escribir_json_atomico(ARCHIVO_CONTABILIDAD, lista_movimientos)
+
+
+def registrar_movimiento(tipo, categoria, descripcion, monto, dni_cliente=None):
+    """Agrega un movimiento al libro contable general.
+
+    'tipo' es 'ingreso' o 'egreso'. Esta función la usan tanto el
+    cobro de cuotas (automático, desde registrar_pago/abonar_deuda)
+    como la carga manual de otros ingresos (bebidas, etc.) y gastos
+    desde la página de Contabilidad."""
+    with _lock_contabilidad:
+        lista_movimientos = cargar_movimientos()
+        nuevo_id = (max((m["id"] for m in lista_movimientos), default=0)) + 1
+        lista_movimientos.append({
+            "id": nuevo_id,
+            "fecha": str(date.today()),
+            "tipo": tipo,
+            "categoria": categoria,
+            "descripcion": descripcion,
+            "monto": monto,
+            "dni_cliente": dni_cliente,
+        })
+        guardar_movimientos(lista_movimientos)
+
+
+def eliminar_movimiento(movimiento_id):
+    """Borra un movimiento del libro contable (para corregir una carga por error)."""
+    with _lock_contabilidad:
+        lista_movimientos = cargar_movimientos()
+        lista_movimientos = [m for m in lista_movimientos if m["id"] != movimiento_id]
+        guardar_movimientos(lista_movimientos)
+
+
+def resumen_mensual():
+    """Agrupa todos los movimientos por mes y devuelve, para cada uno,
+    el total de ingresos, egresos y el neto (ingresos - egresos).
+    Del mes más reciente al más viejo."""
+    acumulado = {}
+    for movimiento in cargar_movimientos():
+        fecha = _parsear_fecha(movimiento.get("fecha"))
+        if fecha is None:
+            continue
+        clave = f"{fecha.year:04d}-{fecha.month:02d}"
+        if clave not in acumulado:
+            acumulado[clave] = {"ingresos": 0, "egresos": 0}
+        if movimiento["tipo"] == "ingreso":
+            acumulado[clave]["ingresos"] += movimiento["monto"]
+        else:
+            acumulado[clave]["egresos"] += movimiento["monto"]
+
+    filas = []
+    for clave in sorted(acumulado.keys(), reverse=True):
+        anio, mes = clave.split("-")
+        ingresos = acumulado[clave]["ingresos"]
+        egresos = acumulado[clave]["egresos"]
+        filas.append({
+            "mes": f"{MESES_ES[int(mes)]} {anio}",
+            "ingresos": ingresos,
+            "egresos": egresos,
+            "neto": ingresos - egresos,
+        })
+    return filas
+
+
+def abonar_deuda(dni, monto):
+    """Registra un abono contra el saldo pendiente de un cliente (sin
+    tocar su fecha de vencimiento, que ya se maneja en registrar_pago).
+
+    Solo se aplica (y se registra como ingreso) hasta el monto de la
+    deuda real: si abonan de más, o el cliente no debe nada, no se
+    anota plata que no cubrió ninguna deuda. Devuelve True si se
+    aplicó algún abono, False si no había nada para aplicar."""
+    nombre_cliente = None
+    monto_aplicado = 0
+    with _lock_clientes:
+        lista_clientes = cargar_clientes()
+        for cliente in lista_clientes:
+            if cliente["DNI"] == dni:
+                saldo_actual = cliente.get("Saldo pendiente", 0)
+                monto_aplicado = min(monto, saldo_actual)
+                if monto_aplicado <= 0:
+                    return False
+                cliente["Saldo pendiente"] = saldo_actual - monto_aplicado
+                guardar_clientes(lista_clientes)
+                nombre_cliente = cliente["Nombre y  Apellido"]
+                break
+
+    if nombre_cliente is None:
+        return False
+
+    registrar_movimiento(
+        "ingreso", "Cuota (saldo)",
+        f"Abono de saldo pendiente - {nombre_cliente} (DNI {dni})",
+        monto_aplicado, dni,
+    )
+    return True
 
 
 # ============================================================
@@ -991,6 +1131,11 @@ body {
 }
 .anuncio-fecha { font-size: 11px; color: #16803d; font-weight: 700; text-transform: uppercase; }
 
+.deuda-aviso {
+    background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(217, 119, 6, 0.4);
+    border-radius: 12px; padding: 10px 14px; color: #92400e; font-size: 14px; font-weight: 700;
+}
+
 .btn-whatsapp {
     background: #25D366 !important; color: white !important;
     box-shadow: 0 8px 20px rgba(37, 211, 102, 0.35);
@@ -1068,6 +1213,9 @@ def construir_navbar():
                 if es_dueño():
                     ui.button('Usuarios', icon='manage_accounts',
                               on_click=lambda: ui.navigate.to('/usuarios')) \
+                        .props('flat').classes('nav-button')
+                    ui.button('Contabilidad', icon='account_balance',
+                              on_click=lambda: ui.navigate.to('/contabilidad')) \
                         .props('flat').classes('nav-button')
                     ui.button('Precios', icon='sell',
                               on_click=lambda: ui.navigate.to('/precios')) \
@@ -1361,6 +1509,13 @@ def pagina_mi_cuenta():
                     else:
                         ui.label(f"Te quedan {dias} día(s) de cuota vigente.")
 
+                # --- Saldo pendiente (solo si tiene deuda) ---
+                saldo_pendiente = cliente.get('Saldo pendiente', 0)
+                if saldo_pendiente > 0:
+                    ui.label(f"Tenés un saldo pendiente de {formatear_moneda(saldo_pendiente)}. "
+                             f"Acercate a completarlo cuando puedas.") \
+                        .classes('deuda-aviso w-full mb-4')
+
                 # --- Tus datos ---
                 with ui.row().classes('w-full items-center justify-between mt-2 mb-1'):
                     ui.label('Tus datos').classes('text-lg font-bold')
@@ -1503,14 +1658,31 @@ def abrir_formulario_editar_cliente(dni_original, al_guardar):
 
 
 def abrir_dialogo_pago(dni, nombre, al_registrar):
-    """Diálogo para registrar un pago, eligiendo con un calendario hasta qué fecha queda cubierta la cuota."""
+    """Diálogo para registrar un pago (total o parcial).
+
+    Se elige con un calendario hasta qué fecha queda cubierta la
+    cuota y cuánto abona el cliente ahora. Si abona menos que el
+    precio del plan, la diferencia queda como saldo pendiente."""
+    cliente = buscar_cliente_por_dni(dni)
+    precio_plan = precio_de_plan(cliente["Plan"]) if cliente else 0
+    saldo_actual = cliente.get("Saldo pendiente", 0) if cliente else 0
+
     with ui.dialog() as dialog:
-        with ui.card().classes('w-[400px] max-w-[95vw] p-7'):
+        with ui.card().classes('w-[420px] max-w-[95vw] p-7'):
             ui.label('Registrar pago').classes('text-xl font-bold')
-            ui.label(f'Cliente: {nombre}').classes('text-gray-600 mb-3')
+            ui.label(f'Cliente: {nombre}').classes('text-gray-600')
+            ui.label(f'Precio del plan: {formatear_moneda(precio_plan)}').classes('text-sm text-gray-600 mb-2')
+
+            if saldo_actual > 0:
+                ui.label(f'Saldo pendiente actual: {formatear_moneda(saldo_actual)}') \
+                    .classes('deuda-aviso w-full mb-2')
+
+            monto_abonado = ui.number(
+                label='Monto que abona ahora', value=precio_plan, min=0, step=500, prefix='$'
+            ).props('outlined').classes('w-full')
 
             sugerencia = str(date.today() + timedelta(days=30))
-            ui.label('Cuota paga hasta:').classes('text-sm text-gray-600')
+            ui.label('Cuota paga hasta:').classes('text-sm text-gray-600 mt-2')
             calendario = ui.date(value=sugerencia).props('outlined')
 
             with ui.row().classes('w-full justify-end gap-2 mt-5'):
@@ -1520,13 +1692,60 @@ def abrir_dialogo_pago(dni, nombre, al_registrar):
                     if not calendario.value:
                         ui.notify('Elegí una fecha en el calendario.', type='negative')
                         return
-                    registrar_pago(dni, calendario.value)
+                    monto = monto_abonado.value or 0
+                    if monto <= 0:
+                        ui.notify('El monto abonado tiene que ser mayor a cero.', type='negative')
+                        return
+
+                    registrar_pago(dni, calendario.value, monto)
                     ui.notify('Pago registrado, vencimiento actualizado.', type='positive')
                     dialog.close()
                     al_registrar()
 
                 ui.button('Confirmar pago', icon='payments', on_click=confirmar) \
                     .props('unelevated color=primary')
+
+    dialog.open()
+
+
+def abrir_dialogo_abonar_deuda(dni, nombre, al_registrar):
+    """Diálogo para que un cliente complete un saldo pendiente, sin
+    tocar su fecha de vencimiento."""
+    cliente = buscar_cliente_por_dni(dni)
+    saldo_actual = cliente.get("Saldo pendiente", 0) if cliente else 0
+
+    with ui.dialog() as dialog:
+        with ui.card().classes('w-[400px] max-w-[95vw] p-7'):
+            ui.label('Abonar saldo pendiente').classes('text-xl font-bold')
+            ui.label(f'Cliente: {nombre}').classes('text-gray-600 mb-2')
+
+            if saldo_actual <= 0:
+                ui.label('Este cliente no tiene saldo pendiente.').classes('text-sm text-gray-600')
+                with ui.row().classes('w-full justify-end mt-4'):
+                    ui.button('Cerrar', on_click=dialog.close).props('flat')
+            else:
+                ui.label(f'Debe: {formatear_moneda(saldo_actual)}').classes('deuda-aviso w-full mb-2')
+
+                monto_abono = ui.number(
+                    label='Monto que abona', value=saldo_actual, min=0, max=saldo_actual,
+                    step=500, prefix='$'
+                ).props('outlined').classes('w-full')
+
+                with ui.row().classes('w-full justify-end gap-2 mt-5'):
+                    ui.button('Cancelar', on_click=dialog.close).props('flat')
+
+                    def confirmar():
+                        monto = monto_abono.value or 0
+                        if monto <= 0:
+                            ui.notify('El monto tiene que ser mayor a cero.', type='negative')
+                            return
+                        abonar_deuda(dni, monto)
+                        ui.notify('Abono registrado.', type='positive')
+                        dialog.close()
+                        al_registrar()
+
+                    ui.button('Registrar abono', icon='payments', on_click=confirmar) \
+                        .props('unelevated color=primary')
 
     dialog.open()
 
@@ -1583,15 +1802,19 @@ def abrir_dialogo_historial(dni, nombre):
             else:
                 columnas = [
                     {'name': 'fecha', 'label': 'Fecha de pago', 'field': 'fecha', 'align': 'left'},
-                    {'name': 'monto', 'label': 'Monto', 'field': 'monto', 'align': 'left'},
+                    {'name': 'monto', 'label': 'Monto abonado', 'field': 'monto', 'align': 'left'},
                     {'name': 'vencimiento', 'label': 'Dejó pago hasta', 'field': 'vencimiento', 'align': 'left'},
+                    {'name': 'saldo', 'label': 'Saldo tras el pago', 'field': 'saldo', 'align': 'left'},
                 ]
                 filas = [{
                     'fecha': formatear_fecha(pago['fecha']),
                     'monto': formatear_moneda(pago.get('monto', 0)),
                     'vencimiento': formatear_fecha(pago['vencimiento']),
-                } for pago in historial]
-                ui.table(columns=columnas, rows=filas, row_key='fecha').classes('w-full')
+                    'saldo': formatear_moneda(pago.get('saldo_pendiente_tras_pago', 0)),
+                } for indice, pago in enumerate(historial)]
+                for indice, fila in enumerate(filas):
+                    fila['indice'] = indice
+                ui.table(columns=columnas, rows=filas, row_key='indice').classes('w-full')
 
             with ui.row().classes('w-full justify-end mt-4'):
                 ui.button('Cerrar', on_click=dialog.close).props('flat')
@@ -1710,6 +1933,7 @@ def pagina_principal():
                     {'name': 'nacimiento', 'label': 'Cumpleaños', 'field': 'nacimiento', 'align': 'left'},
                     {'name': 'vencimiento', 'label': 'Vencimiento', 'field': 'vencimiento', 'align': 'left'},
                     {'name': 'activo', 'label': 'Activo', 'field': 'activo', 'align': 'left'},
+                    {'name': 'debe', 'label': 'Debe', 'field': 'debe', 'align': 'left'},
                 ]
                 if es_dueño():
                     columnas.append(
@@ -1736,6 +1960,10 @@ def pagina_principal():
                                @click="$parent.$emit('pagar', props.row)">
                             <q-tooltip>Registrar pago</q-tooltip>
                         </q-btn>
+                        <q-btn flat round dense icon="account_balance_wallet" color="primary"
+                               @click="$parent.$emit('abonar', props.row)">
+                            <q-tooltip>Abonar saldo pendiente</q-tooltip>
+                        </q-btn>
                         <q-btn flat round dense icon="history" color="primary"
                                @click="$parent.$emit('historial', props.row)">
                             <q-tooltip>Historial de pagos</q-tooltip>
@@ -1754,6 +1982,9 @@ def pagina_principal():
                 def on_pagar(e):
                     abrir_dialogo_pago(e.args['dni'], e.args['nombre'], refrescar)
 
+                def on_abonar(e):
+                    abrir_dialogo_abonar_deuda(e.args['dni'], e.args['nombre'], refrescar)
+
                 def on_historial(e):
                     abrir_dialogo_historial(e.args['dni'], e.args['nombre'])
 
@@ -1768,6 +1999,7 @@ def pagina_principal():
 
                 tabla.on('editar', on_editar)
                 tabla.on('pagar', on_pagar)
+                tabla.on('abonar', on_abonar)
                 tabla.on('historial', on_historial)
                 tabla.on('rutina', on_rutina)
                 tabla.on('eliminar', on_eliminar)
@@ -2143,6 +2375,144 @@ def pagina_anuncios():
                                 refrescar()
 
                             ui.button(icon='delete', on_click=eliminar).props('flat round color=negative')
+
+            refrescar()
+
+        construir_footer()
+
+
+# ============================================================
+# PÁGINA: CONTABILIDAD (solo dueño)
+# ============================================================
+
+@ui.page('/contabilidad')
+def pagina_contabilidad():
+    """Página de contabilidad (solo dueño).
+
+    Muestra el resumen mes a mes de ingresos, egresos y neto, y
+    permite cargar a mano otros ingresos (bebidas, etc.) y gastos.
+    Los cobros de cuotas aparecen solos, registrados automáticamente
+    al cargar un pago desde la página de Clientes."""
+    if not requerir_autenticacion():
+        return
+
+    if not es_dueño():
+        ui.notify('No tenés permisos para acceder a esta página.', type='negative')
+        ui.navigate.to('/')
+        return
+
+    ui.add_head_html(f'<style>{CSS}</style>')
+    construir_navbar()
+
+    with ui.column().classes('w-full min-h-screen'):
+        with ui.column().classes('w-full max-w-5xl mx-auto p-8 gap-6'):
+
+            ui.label('Contabilidad').classes('page-title')
+            ui.label('Ingresos y gastos del gimnasio, mes a mes. Las cuotas se '
+                      'registran solas cuando cargás un pago; acá podés sumar '
+                      'otros ingresos (bebidas, etc.) o restar gastos.') \
+                .classes('page-subtitle')
+
+            # --- Formulario de carga manual ---
+            with ui.column().classes('glass-card w-full p-6 gap-3'):
+                ui.label('Registrar movimiento').classes('text-lg font-bold')
+
+                with ui.row().classes('w-full items-center gap-3'):
+                    tipo_select = ui.select(
+                        {'ingreso': 'Ingreso (suma)', 'egreso': 'Gasto (resta)'},
+                        value='ingreso', label='Tipo'
+                    ).props('outlined dense').classes('w-48')
+                    categoria_input = ui.input('Categoría (ej: Bebidas, Luz, Limpieza)') \
+                        .props('outlined dense').classes('w-72')
+                    monto_input = ui.number(label='Monto', min=0, step=500, prefix='$') \
+                        .props('outlined dense').classes('w-40')
+
+                descripcion_input = ui.input('Descripción (opcional)') \
+                    .props('outlined dense').classes('w-full')
+
+                def registrar():
+                    monto = monto_input.value or 0
+                    categoria = categoria_input.value.strip()
+                    if monto <= 0:
+                        ui.notify('El monto tiene que ser mayor a cero.', type='negative')
+                        return
+                    if not categoria:
+                        ui.notify('Poné una categoría (ej: Bebidas, Luz...).', type='negative')
+                        return
+
+                    registrar_movimiento(
+                        tipo_select.value, categoria,
+                        descripcion_input.value.strip() or categoria, monto,
+                    )
+                    categoria_input.value = ''
+                    descripcion_input.value = ''
+                    monto_input.value = None
+                    ui.notify('Movimiento registrado.', type='positive')
+                    refrescar()
+
+                ui.button('Registrar', icon='add', on_click=registrar) \
+                    .props('unelevated color=primary').classes('self-start')
+
+            # --- Resumen mes a mes ---
+            ui.label('Resumen mensual').classes('text-lg font-bold mt-2')
+            with ui.column().classes('table-container w-full p-4'):
+                columnas_resumen = [
+                    {'name': 'mes', 'label': 'Mes', 'field': 'mes', 'align': 'left'},
+                    {'name': 'ingresos', 'label': 'Ingresos', 'field': 'ingresos', 'align': 'left'},
+                    {'name': 'egresos', 'label': 'Gastos', 'field': 'egresos', 'align': 'left'},
+                    {'name': 'neto', 'label': 'Neto', 'field': 'neto', 'align': 'left'},
+                ]
+                tabla_resumen = ui.table(columns=columnas_resumen, rows=[], row_key='mes') \
+                    .classes('w-full')
+
+            # --- Últimos movimientos ---
+            ui.label('Últimos movimientos').classes('text-lg font-bold mt-2')
+            with ui.column().classes('table-container w-full p-4'):
+                columnas_mov = [
+                    {'name': 'fecha', 'label': 'Fecha', 'field': 'fecha', 'align': 'left'},
+                    {'name': 'tipo', 'label': 'Tipo', 'field': 'tipo', 'align': 'left'},
+                    {'name': 'categoria', 'label': 'Categoría', 'field': 'categoria', 'align': 'left'},
+                    {'name': 'descripcion', 'label': 'Descripción', 'field': 'descripcion', 'align': 'left'},
+                    {'name': 'monto', 'label': 'Monto', 'field': 'monto', 'align': 'left'},
+                    {'name': 'acciones', 'label': '', 'field': 'acciones', 'align': 'right'},
+                ]
+                tabla_mov = ui.table(columns=columnas_mov, rows=[], row_key='id').classes('w-full')
+
+                tabla_mov.add_slot('body-cell-acciones', '''
+                    <q-td :props="props">
+                        <q-btn flat round dense icon="delete" color="negative"
+                               @click="$parent.$emit('eliminar', props.row)">
+                            <q-tooltip>Eliminar movimiento</q-tooltip>
+                        </q-btn>
+                    </q-td>
+                ''')
+
+                def on_eliminar_movimiento(e):
+                    eliminar_movimiento(e.args['id'])
+                    ui.notify('Movimiento eliminado.', type='positive')
+                    refrescar()
+
+                tabla_mov.on('eliminar', on_eliminar_movimiento)
+
+            def refrescar():
+                tabla_resumen.rows = [{
+                    'mes': fila['mes'],
+                    'ingresos': formatear_moneda(fila['ingresos']),
+                    'egresos': formatear_moneda(fila['egresos']),
+                    'neto': formatear_moneda(fila['neto']),
+                } for fila in resumen_mensual()]
+
+                movimientos = sorted(
+                    cargar_movimientos(), key=lambda m: (m.get('fecha', ''), m['id']), reverse=True
+                )[:50]
+                tabla_mov.rows = [{
+                    'id': m['id'],
+                    'fecha': formatear_fecha(m['fecha']),
+                    'tipo': 'Ingreso' if m['tipo'] == 'ingreso' else 'Gasto',
+                    'categoria': m['categoria'],
+                    'descripcion': m['descripcion'],
+                    'monto': formatear_moneda(m['monto']),
+                } for m in movimientos]
 
             refrescar()
 

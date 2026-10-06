@@ -1,1 +1,18 @@
-.venv
+# Datos reales del gimnasio: NUNCA subirlos al repositorio
+usuarios.db
+Clientes.json
+precios.json
+informacion.json
+anuncios.json
+contabilidad.json
+.storage_secret
+.nicegui/
+data/
+*.tmp
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env

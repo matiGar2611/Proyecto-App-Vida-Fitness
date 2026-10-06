@@ -21,6 +21,15 @@ de base de datos externo:
 
 Se ejecuta con: python gimnasio_completo.py
 Requiere: pip install nicegui
+
+Variables de entorno (todas opcionales, pero muy recomendadas en producción):
+    - ADMIN_PASSWORD  contraseña inicial de la cuenta 'admin' (mínimo 8
+                      caracteres). Si no está, se genera una al azar y se
+                      muestra una sola vez en la consola / logs.
+    - STORAGE_SECRET  clave larga y aleatoria que firma las sesiones.
+    - DATA_DIR        carpeta donde se guardan todos los datos (en Render,
+                      el punto de montaje del disco persistente, ej. /data).
+    - PORT            puerto donde escucha el servidor.
 """
 
 from nicegui import app, ui
@@ -33,7 +42,12 @@ import csv
 import io
 import tempfile
 import threading
+import hmac
+import time
+import html as html_lib
+from html.parser import HTMLParser
 from urllib.parse import quote
+from starlette.middleware.base import BaseHTTPMiddleware
 from datetime import date, timedelta, datetime
 
 
@@ -41,8 +55,19 @@ from datetime import date, timedelta, datetime
 # CONFIGURACIÓN
 # ============================================================
 
-DB_USUARIOS = 'usuarios.db'
-ARCHIVO_CLIENTES = 'Clientes.json'
+# Carpeta donde se guardan TODOS los datos. Por defecto, la carpeta
+# actual. En Render, apuntarla al disco persistente (ej. DATA_DIR=/data),
+# si no, los datos se pierden en cada reinicio o deploy.
+DATA_DIR = os.environ.get('DATA_DIR', '.')
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _ruta_datos(nombre):
+    return os.path.join(DATA_DIR, nombre)
+
+
+DB_USUARIOS = _ruta_datos('usuarios.db')
+ARCHIVO_CLIENTES = _ruta_datos('Clientes.json')
 
 ROLES = ['dueño', 'profe']  # el rol 'cliente' no vive en esta tabla: se entra solo con el DNI
 
@@ -54,7 +79,7 @@ NUMERO_WHATSAPP_GIMNASIO = "5492634847749"
 # Encuesta anónima de satisfacción / propuestas de mejora.
 LINK_ENCUESTA = "https://qr-feedback-collector.web.app?location=1774472795678"
 
-ARCHIVO_INFORMACION = 'informacion.json'
+ARCHIVO_INFORMACION = _ruta_datos('informacion.json')
 
 # Logo del gimnasio, incrustado como data URI (así el .py queda
 # autocontenido, sin depender de un archivo de imagen aparte).
@@ -68,7 +93,7 @@ INFO_IMPORTANTE_POR_DEFECTO = """
 - Cualquier consulta sobre tu cuota, hablá con recepción.
 """.strip()
 
-ARCHIVO_PRECIOS = 'precios.json'
+ARCHIVO_PRECIOS = _ruta_datos('precios.json')
 
 PRECIOS_POR_DEFECTO = {
     "2 veces por semana": 15000,
@@ -140,6 +165,181 @@ def precio_de_plan(plan):
 
 
 # ============================================================
+# SEGURIDAD: límites de intentos, sanitizado de HTML, CSV seguro y
+# clave de sesión
+# ============================================================
+
+MIN_PASSWORD_PERSONAL = 8   # dueño y profes
+MIN_PASSWORD_CLIENTE = 6
+
+MAX_INTENTOS_LOGIN = 5
+SEGUNDOS_BLOQUEO_LOGIN = 300
+
+_intentos_fallidos = {}
+_lock_intentos = threading.Lock()
+
+
+def segundos_de_bloqueo(clave):
+    """Si 'clave' (ej. 'cliente:12345678') acumuló demasiados intentos
+    fallidos recientes, devuelve cuántos segundos faltan para poder
+    reintentar. Si no está bloqueada, devuelve 0."""
+    ahora = time.time()
+    with _lock_intentos:
+        recientes = [t for t in _intentos_fallidos.get(clave, [])
+                     if ahora - t < SEGUNDOS_BLOQUEO_LOGIN]
+        if recientes:
+            _intentos_fallidos[clave] = recientes
+        else:
+            _intentos_fallidos.pop(clave, None)
+        if len(recientes) >= MAX_INTENTOS_LOGIN:
+            return int(SEGUNDOS_BLOQUEO_LOGIN - (ahora - recientes[-MAX_INTENTOS_LOGIN])) + 1
+        return 0
+
+
+def registrar_fallo(clave):
+    """Anota un intento de login fallido para 'clave'."""
+    ahora = time.time()
+    with _lock_intentos:
+        _intentos_fallidos.setdefault(clave, []).append(ahora)
+        if len(_intentos_fallidos) > 5000:
+            # Limpieza para que alguien probando miles de DNI al azar no llene la memoria.
+            for k in list(_intentos_fallidos):
+                if all(ahora - t >= SEGUNDOS_BLOQUEO_LOGIN for t in _intentos_fallidos[k]):
+                    del _intentos_fallidos[k]
+
+
+def limpiar_fallos(clave):
+    """Borra los intentos fallidos de 'clave' (se llama tras un login correcto)."""
+    with _lock_intentos:
+        _intentos_fallidos.pop(clave, None)
+
+
+def texto_bloqueo(segundos):
+    """Mensaje para mostrar cuando un login está temporalmente bloqueado."""
+    minutos = segundos // 60 + 1
+    return f'Demasiados intentos fallidos. Probá de nuevo en {minutos} minuto(s).'
+
+
+class _SaneadorHTML(HTMLParser):
+    """Deja pasar solo etiquetas de formato simple (negrita, listas,
+    títulos...) y descarta TODO lo demás: atributos, scripts, estilos,
+    imágenes, links, eventos como onclick, etc. Es lo que se usa para
+    mostrar la rutina, que se guarda como HTML."""
+
+    PERMITIDAS = {
+        'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'br', 'p', 'div', 'span',
+        'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'blockquote', 'pre', 'code',
+    }
+    SIN_CIERRE = {'br'}
+    DESCARTAR_CONTENIDO = {'script', 'style', 'iframe', 'object', 'embed', 'template', 'svg', 'math'}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.partes = []
+        self.pila = []
+        self._descartando = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.DESCARTAR_CONTENIDO:
+            self._descartando += 1
+            return
+        if self._descartando or tag not in self.PERMITIDAS:
+            return
+        self.partes.append(f'<{tag}>')
+        if tag not in self.SIN_CIERRE:
+            self.pila.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in self.DESCARTAR_CONTENIDO or self._descartando:
+            return
+        if tag in self.PERMITIDAS and tag in self.SIN_CIERRE:
+            self.partes.append(f'<{tag}>')
+
+    def handle_endtag(self, tag):
+        if tag in self.DESCARTAR_CONTENIDO:
+            self._descartando = max(0, self._descartando - 1)
+            return
+        if self._descartando or tag not in self.PERMITIDAS or tag in self.SIN_CIERRE:
+            return
+        if tag in self.pila:
+            while self.pila:
+                abierta = self.pila.pop()
+                self.partes.append(f'</{abierta}>')
+                if abierta == tag:
+                    break
+
+    def handle_data(self, data):
+        if not self._descartando:
+            self.partes.append(html_lib.escape(data))
+
+    def resultado(self):
+        while self.pila:
+            self.partes.append(f'</{self.pila.pop()}>')
+        return ''.join(self.partes)
+
+
+def sanitizar_html(texto):
+    """Devuelve 'texto' limpio para mostrarlo como HTML sin riesgo de
+    que ejecute código en el navegador de quien lo mira."""
+    if not texto:
+        return ''
+    try:
+        saneador = _SaneadorHTML()
+        saneador.feed(texto)
+        saneador.close()
+        return saneador.resultado()
+    except Exception:
+        return html_lib.escape(texto)
+
+
+def _celda_csv(valor):
+    """Evita la 'inyección de fórmulas' en Excel: si un texto empieza con
+    =, +, - o @, Excel puede interpretarlo como una fórmula al abrir el CSV."""
+    if isinstance(valor, str) and valor[:1] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + valor
+    return valor
+
+
+class _EscritorCSVSeguro:
+    """Envuelve csv.writer aplicando _celda_csv a cada celda."""
+
+    def __init__(self, buffer, delimiter=';'):
+        self._escritor = csv.writer(buffer, delimiter=delimiter)
+
+    def writerow(self, fila):
+        self._escritor.writerow([_celda_csv(celda) for celda in fila])
+
+
+def obtener_storage_secret():
+    """Clave que firma las sesiones del navegador. Sale de la variable
+    de entorno STORAGE_SECRET; si no está, se genera una al azar y se
+    guarda en DATA_DIR (así las sesiones sobreviven a un reinicio)."""
+    desde_entorno = os.environ.get('STORAGE_SECRET', '').strip()
+    if len(desde_entorno) >= 16:
+        return desde_entorno
+    if desde_entorno:
+        print("AVISO: STORAGE_SECRET es demasiado corta (mínimo 16 caracteres); se ignora.", flush=True)
+
+    ruta = _ruta_datos('.storage_secret')
+    try:
+        with open(ruta, 'r', encoding='utf-8') as archivo:
+            guardada = archivo.read().strip()
+        if len(guardada) >= 32:
+            return guardada
+    except OSError:
+        pass
+
+    nueva = secrets.token_urlsafe(48)
+    try:
+        descriptor = os.open(ruta, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as archivo:
+            archivo.write(nueva)
+    except OSError:
+        pass
+    return nueva
+
+
+# ============================================================
 # BASE DE DATOS DE USUARIOS (dueño / profe)
 # ============================================================
 
@@ -185,46 +385,103 @@ def inicializar_db():
     crear_usuario_dueño()
 
 
-def hash_password(password, salt=None):
-    """Genera el hash SHA-256 de una contraseña combinada con un salt.
+PBKDF2_ITERACIONES = 600_000
+PREFIJO_HASH = 'pbkdf2_sha256$'
 
-    Si no se pasa 'salt', genera uno nuevo aleatorio (alta de
-    cuenta). Si se pasa uno existente, permite recalcular el mismo
-    hash para compararlo contra el guardado (login)."""
+
+def hash_password(password, salt=None):
+    """Genera el hash PBKDF2-SHA256 de una contraseña combinada con un salt.
+
+    Si no se pasa 'salt', genera uno nuevo aleatorio (alta de cuenta).
+    Devuelve (salt, hash) donde el hash guarda también la cantidad de
+    iteraciones usadas: 'pbkdf2_sha256$<iteraciones>$<hash>'."""
     if salt is None:
         salt = secrets.token_hex(16)
-    hash_val = hashlib.sha256((salt + password).encode('utf-8')).hexdigest()
-    return salt, hash_val
+    derivado = hashlib.pbkdf2_hmac(
+        'sha256', password.encode('utf-8'), salt.encode('utf-8'), PBKDF2_ITERACIONES
+    )
+    return salt, f"{PREFIJO_HASH}{PBKDF2_ITERACIONES}${derivado.hex()}"
 
 
 def verificar_password(password, salt, hash_val):
-    """Compara una contraseña ingresada contra el hash guardado, recalculándolo con el mismo salt."""
-    _, nuevo_hash = hash_password(password, salt)
-    return nuevo_hash == hash_val
+    """Compara una contraseña ingresada contra el hash guardado.
+
+    Entiende el formato nuevo (PBKDF2) y también el viejo (SHA-256
+    simple), para que las cuentas creadas antes sigan pudiendo entrar;
+    después de un login correcto se las pasa al formato nuevo."""
+    if not isinstance(password, str) or not isinstance(salt, str) or not isinstance(hash_val, str):
+        return False
+    if hash_val.startswith(PREFIJO_HASH):
+        try:
+            _, iteraciones, esperado = hash_val.split('$')
+            derivado = hashlib.pbkdf2_hmac(
+                'sha256', password.encode('utf-8'), salt.encode('utf-8'), int(iteraciones)
+            )
+        except (ValueError, TypeError):
+            return False
+        return hmac.compare_digest(derivado.hex().encode('utf-8'), esperado.encode('utf-8'))
+    viejo = hashlib.sha256((salt + password).encode('utf-8')).hexdigest()
+    return hmac.compare_digest(viejo.encode('utf-8'), hash_val.encode('utf-8'))
+
+
+def necesita_rehash(hash_val):
+    """True si el hash guardado es del formato viejo o usa menos iteraciones que las actuales."""
+    if not isinstance(hash_val, str) or not hash_val.startswith(PREFIJO_HASH):
+        return True
+    try:
+        return int(hash_val.split('$')[1]) < PBKDF2_ITERACIONES
+    except (IndexError, ValueError):
+        return True
+
+
+# Hash de relleno: se usa para que un usuario/DNI inexistente tarde lo
+# mismo en responder que uno real (así no se puede adivinar cuáles existen).
+_SALT_DUMMY, _HASH_DUMMY = hash_password(secrets.token_hex(8))
 
 
 def crear_usuario_dueño():
-    """Crea la cuenta del dueño ('admin' / 'admin123') la primera vez que se ejecuta el programa, si la tabla de usuarios está vacía."""
+    """Crea la cuenta del dueño ('admin') la primera vez que se ejecuta el
+    programa, si la tabla de usuarios está vacía.
+
+    La contraseña sale de la variable de entorno ADMIN_PASSWORD. Si no
+    está definida (o es muy corta), se genera una al azar y se imprime
+    UNA sola vez en la consola / logs."""
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM usuarios")
+    mensaje = None
     if cursor.fetchone()[0] == 0:
-        salt, hash_val = hash_password('admin123')
+        clave = os.environ.get('ADMIN_PASSWORD', '')
+        if len(clave) < MIN_PASSWORD_PERSONAL:
+            clave = secrets.token_urlsafe(12)
+            mensaje = (
+                "=" * 60 + "\n"
+                "CUENTA DEL DUEÑO CREADA\n"
+                f"  Usuario:    admin\n"
+                f"  Contraseña: {clave}\n"
+                "Guardala ahora y cambiala desde la app (candado arriba a la derecha).\n"
+                "Para elegir la tuya, definí ADMIN_PASSWORD (mínimo 8 caracteres).\n"
+                + "=" * 60
+            )
+        salt, hash_val = hash_password(clave)
+        # 'password_plain' es una columna heredada: ya no se guarda nada ahí.
         cursor.execute(
             "INSERT INTO usuarios (username, password_hash, salt, password_plain, nombre, rol) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            ('admin', hash_val, salt, 'admin123', 'Dueño del gimnasio', 'dueño')
+            ('admin', hash_val, salt, '', 'Dueño del gimnasio', 'dueño')
         )
         conn.commit()
     conn.close()
+    if mensaje:
+        print(mensaje, flush=True)
 
 
 def obtener_usuario(username):
-    """Busca un usuario por su nombre de usuario. Devuelve la fila completa, o None si no existe."""
+    """Busca un usuario por su nombre de usuario. Devuelve (id, username, password_hash, salt, nombre, rol), o None si no existe."""
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, username, password_hash, salt, nombre, rol, password_plain "
+        "SELECT id, username, password_hash, salt, nombre, rol "
         "FROM usuarios WHERE username = ?",
         (username,)
     )
@@ -234,11 +491,13 @@ def obtener_usuario(username):
 
 
 def obtener_usuario_por_id(user_id):
-    """Busca un usuario por su id numérico. Devuelve la fila completa, o None si no existe."""
+    """Busca un usuario por su id numérico. Devuelve (id, username, password_hash, salt, nombre, rol), o None si no existe."""
+    if user_id is None:
+        return None
     conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, username, password_hash, salt, nombre, rol, password_plain "
+        "SELECT id, username, password_hash, salt, nombre, rol "
         "FROM usuarios WHERE id = ?",
         (user_id,)
     )
@@ -251,23 +510,31 @@ def obtener_todos_usuarios():
     """Devuelve todos los usuarios registrados, ordenados por rol y nombre, para la página de Usuarios."""
     conn = conectar_db()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, username, nombre, rol, password_plain FROM usuarios ORDER BY rol, nombre"
-    )
+    cursor.execute("SELECT id, username, nombre, rol FROM usuarios ORDER BY rol, nombre")
     usuarios = cursor.fetchall()
     conn.close()
     return usuarios
 
 
+def contar_dueños():
+    """Cantidad de cuentas con rol 'dueño' (para no quedarse nunca sin ninguna)."""
+    conn = conectar_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM usuarios WHERE rol = 'dueño'")
+    cantidad = cursor.fetchone()[0]
+    conn.close()
+    return cantidad
+
+
 def crear_usuario(username, password, nombre, rol):
-    """Da de alta una cuenta nueva (dueño o profe), guardando el hash de la contraseña y también una copia en texto plano para que el dueño pueda consultarla."""
+    """Da de alta una cuenta nueva (dueño o profe), guardando solo el hash de la contraseña."""
     conn = conectar_db()
     cursor = conn.cursor()
     salt, hash_val = hash_password(password)
     cursor.execute(
         "INSERT INTO usuarios (username, password_hash, salt, password_plain, nombre, rol) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        (username, hash_val, salt, password, nombre, rol)
+        (username, hash_val, salt, '', nombre, rol)
     )
     conn.commit()
     conn.close()
@@ -276,16 +543,16 @@ def crear_usuario(username, password, nombre, rol):
 def actualizar_usuario(user_id, username, nombre, rol, nueva_password=None):
     """Actualiza los datos de una cuenta existente.
 
-    Si se pasa 'nueva_password', también actualiza el hash y la
-    copia en texto plano; si no, la contraseña queda sin cambios."""
+    Si se pasa 'nueva_password', también actualiza el hash; si no, la
+    contraseña queda sin cambios."""
     conn = conectar_db()
     cursor = conn.cursor()
     if nueva_password:
         salt, hash_val = hash_password(nueva_password)
         cursor.execute(
             "UPDATE usuarios SET username = ?, nombre = ?, rol = ?, "
-            "password_hash = ?, salt = ?, password_plain = ? WHERE id = ?",
-            (username, nombre, rol, hash_val, salt, nueva_password, user_id)
+            "password_hash = ?, salt = ?, password_plain = '' WHERE id = ?",
+            (username, nombre, rol, hash_val, salt, user_id)
         )
     else:
         cursor.execute(
@@ -309,9 +576,29 @@ def eliminar_usuario(user_id):
 # El rol 'cliente' NO vive en usuarios.db: se arma en el momento del
 # login por DNI (ver pagina_login) y se guarda solo en app.storage.user.
 
+def sesion_valida():
+    """Comprueba que la sesión guardada en el navegador siga correspondiendo
+    a una cuenta que existe (y con el mismo rol). Así, si se borra un
+    profe, se le cambia el rol o se elimina un cliente, su sesión abierta
+    deja de funcionar en el momento."""
+    rol = app.storage.user.get('rol')
+    if rol is None:
+        return False
+    if rol == 'cliente':
+        dni = app.storage.user.get('dni')
+        return bool(dni) and buscar_cliente_por_dni(dni) is not None
+    registro = obtener_usuario_por_id(app.storage.user.get('id'))
+    return registro is not None and registro[5] == rol
+
+
 def verificar_autenticacion():
-    """Indica si hay una sesión activa (dueño, profe o cliente) en este navegador."""
-    return 'rol' in app.storage.user
+    """Indica si hay una sesión activa y válida (dueño, profe o cliente) en este navegador."""
+    if 'rol' not in app.storage.user:
+        return False
+    if not sesion_valida():
+        app.storage.user.clear()
+        return False
+    return True
 
 
 def rol_actual():
@@ -325,8 +612,8 @@ def dni_actual():
 
 
 def es_dueño():
-    """Indica si la sesión activa corresponde al rol 'dueño'."""
-    return rol_actual() == 'dueño'
+    """Indica si la sesión activa corresponde al rol 'dueño' (y sigue siendo válida)."""
+    return rol_actual() == 'dueño' and sesion_valida()
 
 
 def es_cliente_rol():
@@ -386,7 +673,8 @@ def buscar_cliente_por_dni(dni):
 def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
     """Arma el diccionario de un cliente nuevo, con el vencimiento a 30
     días, el primer registro en su historial de pagos, y una
-    contraseña inicial igual a su DNI (que después puede cambiar)."""
+    contraseña inicial igual a su DNI, que tiene que cambiar la primera
+    vez que entra."""
     hoy = date.today()
     precio_inicial = precio_de_plan(plan)
     salt, hash_val = hash_password(dni)
@@ -406,7 +694,7 @@ def crear_cliente(dni, nombre_y_apellido, telefono, plan, fecha_nacimiento):
         ],
         "Password Hash": hash_val,
         "Password Salt": salt,
-        "Password Plain": dni,
+        "Debe cambiar password": True,
         "Saldo pendiente": 0,
     }
 
@@ -420,15 +708,12 @@ def verificar_password_cliente(cliente, password_ingresada):
     """
     if "Password Hash" in cliente and "Password Salt" in cliente:
         return verificar_password(password_ingresada, cliente["Password Salt"], cliente["Password Hash"])
-    return password_ingresada == cliente["DNI"]
+    return hmac.compare_digest(password_ingresada.encode('utf-8'), cliente["DNI"].encode('utf-8'))
 
 
-def cambiar_password_cliente(dni, nueva_password):
-    """Cambia la contraseña de un cliente.
-
-    La usa tanto el propio cliente para cambiar la suya, como el
-    login para completarle la contraseña a una ficha vieja que
-    todavía no tenía una guardada."""
+def _guardar_password_cliente(dni, nueva_password, debe_cambiar):
+    """Guarda el hash de una contraseña nueva en la ficha del cliente y
+    marca si todavía tiene que cambiarla (True) o ya es definitiva (False)."""
     with _lock_clientes:
         lista_clientes = cargar_clientes()
         for cliente in lista_clientes:
@@ -436,10 +721,21 @@ def cambiar_password_cliente(dni, nueva_password):
                 salt, hash_val = hash_password(nueva_password)
                 cliente["Password Hash"] = hash_val
                 cliente["Password Salt"] = salt
-                cliente["Password Plain"] = nueva_password
+                cliente["Debe cambiar password"] = debe_cambiar
+                cliente.pop("Password Plain", None)
                 guardar_clientes(lista_clientes)
                 return True
         return False
+
+
+def cambiar_password_cliente(dni, nueva_password):
+    """El cliente elige una contraseña propia: queda como definitiva."""
+    return _guardar_password_cliente(dni, nueva_password, False)
+
+
+def restablecer_password_cliente(dni):
+    """Vuelve la contraseña del cliente a su DNI y lo obliga a cambiarla al entrar."""
+    return _guardar_password_cliente(dni, dni, True)
 
 
 def agregar_cliente(nuevo_cliente):
@@ -598,13 +894,9 @@ def filtrar_clientes(solo_vencidos=False, plan_filtro="Todos", busqueda=""):
     return resultado
 
 
-def obtener_filas(solo_vencidos=False, plan_filtro="Todos", busqueda="", incluir_password=False):
+def obtener_filas(solo_vencidos=False, plan_filtro="Todos", busqueda=""):
     """Arma las filas ya formateadas para la tabla de clientes, a
-    partir de los que cumplen los filtros dados.
-
-    'incluir_password' solo lo pone en True la página de Clientes
-    cuando quien mira es el dueño -- así un profe nunca recibe ese
-    dato en la tabla."""
+    partir de los que cumplen los filtros dados."""
     filas = []
     for cliente in filtrar_clientes(solo_vencidos, plan_filtro, busqueda):
         fila = {
@@ -618,8 +910,6 @@ def obtener_filas(solo_vencidos=False, plan_filtro="Todos", busqueda="", incluir
             "activo": "Sí" if cliente["Cliente Activo"] else "No",
             "debe": formatear_moneda(cliente.get("Saldo pendiente", 0)) if cliente.get("Saldo pendiente", 0) > 0 else "-",
         }
-        if incluir_password:
-            fila["password"] = cliente.get("Password Plain", "(sin definir)")
         filas.append(fila)
     return filas
 
@@ -668,7 +958,7 @@ def exportar_clientes_csv(solo_vencidos=False, plan_filtro="Todos", busqueda="")
     separador porque Excel en configuración regional argentina/
     española lo interpreta mejor que la ','."""
     buffer = io.StringIO()
-    escritor = csv.writer(buffer, delimiter=';')
+    escritor = _EscritorCSVSeguro(buffer, delimiter=';')
     escritor.writerow([
         'DNI', 'Nombre y Apellido', 'Teléfono', 'Plan', 'Fecha de nacimiento',
         'Fecha de inicio', 'Fecha de vencimiento', 'Fecha ultimo pago', 'Activo',
@@ -736,7 +1026,9 @@ def proximos_cumpleanos(dias_rango=30):
 # ============================================================
 
 def actualizar_rutina(dni, texto_rutina):
-    """Guarda (o reemplaza) el texto de la rutina de un cliente puntual."""
+    """Guarda (o reemplaza) el texto de la rutina de un cliente puntual.
+    El HTML se limpia antes de guardarlo (ver sanitizar_html)."""
+    texto_rutina = sanitizar_html(texto_rutina)
     with _lock_clientes:
         lista_clientes = cargar_clientes()
         for cliente in lista_clientes:
@@ -767,7 +1059,7 @@ def guardar_informacion(texto):
 # ANUNCIOS DEL DUEÑO (los ven los clientes y el personal al entrar)
 # ============================================================
 
-ARCHIVO_ANUNCIOS = 'anuncios.json'
+ARCHIVO_ANUNCIOS = _ruta_datos('anuncios.json')
 
 _lock_anuncios = threading.Lock()
 
@@ -808,7 +1100,7 @@ def eliminar_anuncio(anuncio_id):
 # CONTABILIDAD (ingresos, egresos y deuda de clientes)
 # ============================================================
 
-ARCHIVO_CONTABILIDAD = 'contabilidad.json'
+ARCHIVO_CONTABILIDAD = _ruta_datos('contabilidad.json')
 
 _lock_contabilidad = threading.Lock()
 
@@ -1176,8 +1468,8 @@ def abrir_dialogo_cambiar_mi_password():
                     if not verificar_password(actual.value, salt, password_hash):
                         ui.notify('La contraseña actual no es correcta.', type='negative')
                         return
-                    if not nueva.value or len(nueva.value) < 4:
-                        ui.notify('La nueva contraseña debe tener al menos 4 caracteres.', type='negative')
+                    if not nueva.value or len(nueva.value) < MIN_PASSWORD_PERSONAL:
+                        ui.notify(f'La nueva contraseña debe tener al menos {MIN_PASSWORD_PERSONAL} caracteres.', type='negative')
                         return
                     if nueva.value != confirmar.value:
                         ui.notify('Las contraseñas nuevas no coinciden.', type='negative')
@@ -1308,16 +1600,30 @@ def pagina_login():
                             ui.label('Completá usuario y contraseña').classes('login-error w-full')
                         return
 
-                    registro = obtener_usuario(usuario)
-                    if registro is None:
+                    clave_intentos = f"admin:{usuario.lower()}"
+                    espera = segundos_de_bloqueo(clave_intentos)
+                    if espera:
                         with error_admin:
-                            ui.label('Usuario no encontrado').classes('login-error w-full')
+                            ui.label(texto_bloqueo(espera)).classes('login-error w-full')
                         return
 
-                    if not verificar_password(clave, registro[3], registro[2]):
+                    registro = obtener_usuario(usuario)
+                    if registro is None:
+                        verificar_password(clave, _SALT_DUMMY, _HASH_DUMMY)  # igualar tiempos de respuesta
+                        credenciales_ok = False
+                    else:
+                        credenciales_ok = verificar_password(clave, registro[3], registro[2])
+
+                    if not credenciales_ok:
+                        registrar_fallo(clave_intentos)
                         with error_admin:
-                            ui.label('Contraseña incorrecta').classes('login-error w-full')
+                            ui.label('Usuario o contraseña incorrectos').classes('login-error w-full')
                         return
+
+                    limpiar_fallos(clave_intentos)
+                    if necesita_rehash(registro[2]):
+                        # Cuenta con hash viejo: se pasa al formato nuevo ahora que sabemos la clave.
+                        actualizar_usuario(registro[0], registro[1], registro[4], registro[5], clave)
 
                     app.storage.user['id'] = registro[0]
                     app.storage.user['username'] = registro[1]
@@ -1331,10 +1637,6 @@ def pagina_login():
                     .props('unelevated color=primary').classes('w-full mt-2')
                 username_input.on('keydown.enter', lambda e: intentar_login_admin())
                 password_input.on('keydown.enter', lambda e: intentar_login_admin())
-
-                with ui.element('div').classes('login-hint'):
-                    ui.label('Cuenta por defecto (dueño)').classes('login-hint-label')
-                    ui.label('Usuario: admin · Contraseña: admin123').classes('login-hint-text')
 
                 def volver_admin():
                     contenedor_admin.visible = False
@@ -1362,23 +1664,36 @@ def pagina_login():
                             ui.label('Ingresá tu DNI y tu contraseña.').classes('login-error w-full')
                         return
 
+                    clave_intentos = f"cliente:{dni}"
+                    espera = segundos_de_bloqueo(clave_intentos)
+                    if espera:
+                        with error_cliente:
+                            ui.label(texto_bloqueo(espera)).classes('login-error w-full')
+                        return
+
                     cliente = buscar_cliente_por_dni(dni)
                     if cliente is None:
+                        verificar_password(clave, _SALT_DUMMY, _HASH_DUMMY)  # igualar tiempos de respuesta
+                        credenciales_ok = False
+                    else:
+                        credenciales_ok = verificar_password_cliente(cliente, clave)
+
+                    if not credenciales_ok:
+                        registrar_fallo(clave_intentos)
                         with error_cliente:
-                            ui.label('No encontramos ese DNI. Consultá con recepción.') \
+                            ui.label('DNI o contraseña incorrectos. Si no podés ingresar, consultá con recepción.') \
                                 .classes('login-error w-full')
                         return
 
-                    if not verificar_password_cliente(cliente, clave):
-                        with error_cliente:
-                            ui.label('Contraseña incorrecta.').classes('login-error w-full')
-                        return
+                    limpiar_fallos(clave_intentos)
 
-                    # Ficha vieja sin contraseña guardada todavía (entró con
-                    # su DNI como clave, según permite verificar_password_cliente):
-                    # se la completamos ahora para que quede guardada.
+                    # Ficha vieja sin contraseña guardada: entró con su DNI, se
+                    # le guarda ahora y tendrá que cambiarla. Si tiene un hash
+                    # del formato viejo, se lo actualiza al nuevo.
                     if "Password Hash" not in cliente:
-                        cambiar_password_cliente(dni, dni)
+                        restablecer_password_cliente(dni)
+                    elif necesita_rehash(cliente["Password Hash"]):
+                        _guardar_password_cliente(dni, clave, cliente.get("Debe cambiar password", False))
 
                     app.storage.user['rol'] = 'cliente'
                     app.storage.user['dni'] = dni
@@ -1404,16 +1719,26 @@ def pagina_login():
 # PÁGINA: MI CUENTA (cliente)
 # ============================================================
 
-def abrir_dialogo_cambiar_password_cliente(dni):
-    """El cliente cambia su propia contraseña (la que usa para entrar con su DNI)."""
+def abrir_dialogo_cambiar_password_cliente(dni, obligatorio=False):
+    """El cliente cambia su propia contraseña (la que usa para entrar con su DNI).
+
+    Con obligatorio=True (primer ingreso, o después de que recepción se
+    la restableció) el diálogo no se puede cerrar sin elegir una nueva."""
     cliente = buscar_cliente_por_dni(dni)
     if cliente is None:
         ui.notify('No se pudo identificar tu cuenta.', type='negative')
         return
 
     with ui.dialog() as dialog:
+        if obligatorio:
+            dialog.props('persistent')
         with ui.card().classes('w-[420px] max-w-[95vw] p-7'):
-            ui.label('Cambiar mi contraseña').classes('text-xl font-bold mb-3')
+            ui.label('Elegí tu nueva contraseña' if obligatorio else 'Cambiar mi contraseña') \
+                .classes('text-xl font-bold mb-3')
+            if obligatorio:
+                ui.label('Por seguridad, tenés que cambiar tu contraseña inicial (tu DNI) '
+                         'antes de seguir. En "contraseña actual" poné tu DNI.') \
+                    .classes('text-sm text-gray-600 mb-2')
 
             actual = ui.input('Contraseña actual', password=True, password_toggle_button=True) \
                 .props('outlined').classes('w-full')
@@ -1423,15 +1748,19 @@ def abrir_dialogo_cambiar_password_cliente(dni):
                 .props('outlined').classes('w-full')
 
             with ui.row().classes('w-full justify-end gap-2 mt-4'):
-                ui.button('Cancelar', on_click=dialog.close).props('flat')
+                if not obligatorio:
+                    ui.button('Cancelar', on_click=dialog.close).props('flat')
 
                 def guardar():
                     cliente_actualizado = buscar_cliente_por_dni(dni)
-                    if not verificar_password_cliente(cliente_actualizado, actual.value):
+                    if cliente_actualizado is None or not verificar_password_cliente(cliente_actualizado, actual.value):
                         ui.notify('La contraseña actual no es correcta.', type='negative')
                         return
-                    if not nueva.value or len(nueva.value) < 4:
-                        ui.notify('La nueva contraseña debe tener al menos 4 caracteres.', type='negative')
+                    if not nueva.value or len(nueva.value) < MIN_PASSWORD_CLIENTE:
+                        ui.notify(f'La nueva contraseña debe tener al menos {MIN_PASSWORD_CLIENTE} caracteres.', type='negative')
+                        return
+                    if nueva.value == dni:
+                        ui.notify('La nueva contraseña no puede ser tu DNI.', type='negative')
                         return
                     if nueva.value != confirmar.value:
                         ui.notify('Las contraseñas nuevas no coinciden.', type='negative')
@@ -1440,6 +1769,8 @@ def abrir_dialogo_cambiar_password_cliente(dni):
                     cambiar_password_cliente(dni, nueva.value)
                     ui.notify('Contraseña actualizada correctamente.', type='positive')
                     dialog.close()
+                    if obligatorio:
+                        ui.navigate.to('/mi-cuenta')
 
                 ui.button('Guardar', icon='save', on_click=guardar).props('unelevated color=primary')
 
@@ -1472,6 +1803,9 @@ def pagina_mi_cuenta():
                 ui.label('No pudimos encontrar tu ficha. Consultá con recepción.') \
                     .classes('login-error w-full')
             else:
+                if cliente.get('Debe cambiar password'):
+                    abrir_dialogo_cambiar_password_cliente(dni, obligatorio=True)
+
                 ui.label(f"¡Hola, {cliente['Nombre y  Apellido']}!").classes('page-title')
                 ui.label('Este es tu resumen en el gimnasio.').classes('page-subtitle mb-4')
 
@@ -1548,7 +1882,7 @@ def pagina_mi_cuenta():
                 texto_rutina = cliente.get('Rutina', '').strip()
                 with ui.column().classes('rutina-cliente w-full'):
                     if texto_rutina:
-                        ui.html(texto_rutina)
+                        ui.html(sanitizar_html(texto_rutina))
                     else:
                         ui.label('Todavía no tenés una rutina cargada. Consultá con tu profe.')
 
@@ -1842,6 +2176,27 @@ def confirmar_eliminacion(dni, nombre, al_eliminar):
     dialog.open()
 
 
+def confirmar_reset_password(dni, nombre):
+    """Diálogo de confirmación para volver la contraseña de un cliente a su DNI."""
+    with ui.dialog() as dialog:
+        with ui.card().classes('p-7 w-[420px] max-w-[95vw]'):
+            ui.label('Restablecer contraseña').classes('text-xl font-bold')
+            ui.label(f'La contraseña de {nombre} va a volver a ser su DNI, y tendrá que '
+                     f'cambiarla la próxima vez que entre. ¿Continuar?').classes('text-gray-600 mt-3')
+            with ui.row().classes('w-full justify-end gap-2 mt-6'):
+                ui.button('Cancelar', on_click=dialog.close).props('flat')
+
+                def restablecer():
+                    restablecer_password_cliente(dni)
+                    dialog.close()
+                    ui.notify('Contraseña restablecida: ahora es el DNI del cliente.', type='positive')
+
+                ui.button('Restablecer', icon='lock_reset', on_click=restablecer) \
+                    .props('unelevated color=primary')
+
+    dialog.open()
+
+
 # ============================================================
 # PÁGINA PRINCIPAL (dueño / profe)
 # ============================================================
@@ -1935,10 +2290,6 @@ def pagina_principal():
                     {'name': 'activo', 'label': 'Activo', 'field': 'activo', 'align': 'left'},
                     {'name': 'debe', 'label': 'Debe', 'field': 'debe', 'align': 'left'},
                 ]
-                if es_dueño():
-                    columnas.append(
-                        {'name': 'password', 'label': 'Contraseña', 'field': 'password', 'align': 'left'}
-                    )
                 columnas.append({'name': 'acciones', 'label': '', 'field': 'acciones', 'align': 'right'})
 
                 tabla = ui.table(columns=columnas, rows=[], row_key='dni').classes('w-full')
@@ -1972,6 +2323,10 @@ def pagina_principal():
                                @click="$parent.$emit('rutina', props.row)">
                             <q-tooltip>Rutina (texto)</q-tooltip>
                         </q-btn>
+                        <q-btn flat round dense icon="lock_reset" color="primary"
+                               @click="$parent.$emit('resetear', props.row)">
+                            <q-tooltip>Restablecer contraseña</q-tooltip>
+                        </q-btn>
                         {boton_eliminar_html}
                     </q-td>
                 ''')
@@ -2002,6 +2357,11 @@ def pagina_principal():
                 tabla.on('abonar', on_abonar)
                 tabla.on('historial', on_historial)
                 tabla.on('rutina', on_rutina)
+
+                def on_resetear(e):
+                    confirmar_reset_password(e.args['dni'], e.args['nombre'])
+
+                tabla.on('resetear', on_resetear)
                 tabla.on('eliminar', on_eliminar)
 
             def exportar_csv_click():
@@ -2017,7 +2377,6 @@ def pagina_principal():
                     solo_vencidos=checkbox_vencidos.value,
                     plan_filtro=select_plan.value,
                     busqueda=busqueda_input.value or "",
-                    incluir_password=es_dueño(),
                 )
                 lista_clientes = cargar_clientes()
                 etiqueta_activos.set_text(str(sum(1 for c in lista_clientes if c["Cliente Activo"])))
@@ -2087,8 +2446,8 @@ def abrir_formulario_usuario(al_guardar):
                     if not username.value.strip() or not nombre.value.strip():
                         ui.notify('Usuario y nombre son obligatorios.', type='negative')
                         return
-                    if not password.value or len(password.value) < 4:
-                        ui.notify('La contraseña debe tener al menos 4 caracteres.', type='negative')
+                    if not password.value or len(password.value) < MIN_PASSWORD_PERSONAL:
+                        ui.notify(f'La contraseña debe tener al menos {MIN_PASSWORD_PERSONAL} caracteres.', type='negative')
                         return
                     if obtener_usuario(username.value.strip()):
                         ui.notify('Ese nombre de usuario ya existe.', type='negative')
@@ -2133,8 +2492,8 @@ def abrir_formulario_editar_usuario(user_id, al_guardar):
                     if not nuevo_username or not nombre.value.strip():
                         ui.notify('Usuario y nombre son obligatorios.', type='negative')
                         return
-                    if password.value and len(password.value) < 4:
-                        ui.notify('La contraseña debe tener al menos 4 caracteres.', type='negative')
+                    if password.value and len(password.value) < MIN_PASSWORD_PERSONAL:
+                        ui.notify(f'La contraseña debe tener al menos {MIN_PASSWORD_PERSONAL} caracteres.', type='negative')
                         return
 
                     otro = obtener_usuario(nuevo_username)
@@ -2142,8 +2501,16 @@ def abrir_formulario_editar_usuario(user_id, al_guardar):
                         ui.notify('Ese nombre de usuario ya lo usa otra cuenta.', type='negative')
                         return
 
+                    if rol_actual_valor == 'dueño' and rol.value != 'dueño' and contar_dueños() <= 1:
+                        ui.notify('Tiene que quedar al menos una cuenta de dueño.', type='negative')
+                        return
+
                     actualizar_usuario(user_id, nuevo_username, nombre.value.strip(),
                                        rol.value, password.value or None)
+                    if user_id == app.storage.user.get('id'):
+                        app.storage.user['username'] = nuevo_username
+                        app.storage.user['nombre'] = nombre.value.strip()
+                        app.storage.user['rol'] = rol.value
                     ui.notify('Usuario actualizado.', type='positive')
                     dialog.close()
                     al_guardar()
@@ -2183,7 +2550,6 @@ def pagina_usuarios():
                     {'name': 'username', 'label': 'USUARIO', 'field': 'username', 'align': 'left'},
                     {'name': 'nombre', 'label': 'NOMBRE', 'field': 'nombre', 'align': 'left'},
                     {'name': 'rol', 'label': 'ROL', 'field': 'rol', 'align': 'left'},
-                    {'name': 'password_plain', 'label': 'CONTRASEÑA', 'field': 'password_plain', 'align': 'left'},
                     {'name': 'acciones', 'label': '', 'field': 'acciones', 'align': 'right'},
                 ]
                 tabla = ui.table(columns=columnas, rows=[], row_key='id').classes('w-full')
@@ -2205,7 +2571,20 @@ def pagina_usuarios():
                     abrir_formulario_editar_usuario(e.args['id'], refrescar)
 
                 def on_eliminar(e):
-                    eliminar_usuario(e.args['id'])
+                    if not es_dueño():
+                        ui.notify('No tenés permisos para eliminar usuarios.', type='negative')
+                        return
+                    objetivo = obtener_usuario_por_id(e.args['id'])
+                    if objetivo is None:
+                        refrescar()
+                        return
+                    if objetivo[0] == app.storage.user.get('id'):
+                        ui.notify('No podés eliminar tu propia cuenta.', type='negative')
+                        return
+                    if objetivo[1] == 'admin' or (objetivo[5] == 'dueño' and contar_dueños() <= 1):
+                        ui.notify('Esta cuenta no se puede eliminar.', type='negative')
+                        return
+                    eliminar_usuario(objetivo[0])
                     ui.notify('Usuario eliminado.', type='positive')
                     refrescar()
 
@@ -2214,7 +2593,7 @@ def pagina_usuarios():
 
                 def refrescar():
                     tabla.rows = [
-                        {'id': u[0], 'username': u[1], 'nombre': u[2], 'rol': u[3], 'password_plain': u[4]}
+                        {'id': u[0], 'username': u[1], 'nombre': u[2], 'rol': u[3]}
                         for u in obtener_todos_usuarios()
                     ]
 
@@ -2523,13 +2902,77 @@ def pagina_contabilidad():
 # INICIO
 # ============================================================
 
+# ============================================================
+# MIGRACIÓN DE SEGURIDAD (se ejecuta al arrancar; es segura de repetir)
+# ============================================================
+
+def migrar_seguridad():
+    """Deja los datos existentes al día con las medidas de seguridad:
+
+    - Borra las contraseñas en texto plano que versiones anteriores
+      guardaban (usuarios.db y Clientes.json).
+    - Marca a los clientes que todavía usan su DNI como contraseña para
+      que la cambien al entrar.
+    - Si la cuenta 'admin' sigue con la contraseña de fábrica, la cambia
+      por ADMIN_PASSWORD (si está definida) o avisa en la consola.
+    """
+    conn = conectar_db()
+    conn.execute("UPDATE usuarios SET password_plain = '' WHERE password_plain != ''")
+    conn.commit()
+    conn.close()
+
+    with _lock_clientes:
+        lista_clientes = cargar_clientes()
+        hubo_cambios = False
+        for cliente in lista_clientes:
+            if "Password Plain" in cliente:
+                del cliente["Password Plain"]
+                hubo_cambios = True
+            if "Debe cambiar password" not in cliente:
+                if "Password Hash" in cliente and "Password Salt" in cliente:
+                    cliente["Debe cambiar password"] = verificar_password(
+                        cliente["DNI"], cliente["Password Salt"], cliente["Password Hash"]
+                    )
+                else:
+                    cliente["Debe cambiar password"] = True
+                hubo_cambios = True
+        if hubo_cambios:
+            guardar_clientes(lista_clientes)
+
+    registro = obtener_usuario('admin')
+    if registro and verificar_password('admin123', registro[3], registro[2]):
+        nueva = os.environ.get('ADMIN_PASSWORD', '')
+        if len(nueva) >= MIN_PASSWORD_PERSONAL and nueva != 'admin123':
+            actualizar_usuario(registro[0], registro[1], registro[4], registro[5], nueva)
+            print("La cuenta 'admin' tenía la contraseña de fábrica: se reemplazó por ADMIN_PASSWORD.", flush=True)
+        else:
+            print("ATENCIÓN: la cuenta 'admin' todavía usa la contraseña de fábrica (admin123). "
+                  "Cambiala ya, o definí ADMIN_PASSWORD (mínimo 8 caracteres) y reiniciá.", flush=True)
+
+
+class _CabecerasSeguridad(BaseHTTPMiddleware):
+    """Agrega cabeceras de seguridad básicas a todas las respuestas
+    (evita que la app se embeba en otro sitio, etc.)."""
+
+    async def dispatch(self, request, call_next):
+        respuesta = await call_next(request)
+        respuesta.headers.setdefault('X-Content-Type-Options', 'nosniff')
+        respuesta.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+        respuesta.headers.setdefault('Referrer-Policy', 'same-origin')
+        return respuesta
+
+
+app.add_middleware(_CabecerasSeguridad)
+
+
 inicializar_db()
+migrar_seguridad()
 
 ui.run(
     title='Gimnasio Vida Fitness',
     favicon='🏋️',
     reload=False,
-    storage_secret='gimnasio_vida_fitness_secret',
+    storage_secret=obtener_storage_secret(),
 )
 
 # Si la variable de entorno PORT viene con un valor que no es un

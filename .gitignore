@@ -1,5 +1,8 @@
 # Datos reales del gimnasio: NUNCA subirlos al repositorio
-usuarios.db
+gimnasio.db
+respaldos/
+*.db
+*.zip
 Clientes.json
 precios.json
 informacion.json

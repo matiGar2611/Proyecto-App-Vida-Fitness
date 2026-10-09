@@ -8,6 +8,7 @@ Aplicación web hecha con [NiceGUI](https://nicegui.io/) para administrar los so
 
 **Clientes (dueño y profe)**
 - Alta, edición y baja de socios (DNI de 8 dígitos, teléfono de 10 dígitos).
+- El alta registra el **primer pago** (por defecto, el precio del plan; se puede cambiar): queda en el historial del cliente y en la contabilidad. Si abona menos, la diferencia queda como saldo pendiente.
 - Planes: 2 veces por semana, 3 veces por semana y Todos los días.
 - Buscador, filtro por plan y por cuotas vencidas, y exportación a CSV.
 - Pagos totales o parciales (la diferencia queda como saldo pendiente) y abonos posteriores. Cada pago queda en el historial y en la contabilidad.
@@ -62,6 +63,16 @@ La primera vez se crea la cuenta `admin` (dueño):
 
 Los clientes nuevos entran con su DNI como contraseña y **tienen que cambiarla** en el primer ingreso.
 
+### Si te olvidás la contraseña
+
+Desde la consola, con la misma `DATA_DIR` que usa la app:
+
+```bash
+python -m gimnasio.cambiar_clave admin
+```
+
+Pide la contraseña nueva (mínimo 8 caracteres) y la guarda. En Render se corre desde la pestaña **Shell** del servicio (planes pagos). Ojo: `ADMIN_PASSWORD` solo se usa cuando la cuenta `admin` se crea por primera vez; cambiarla después en Render no cambia la de una cuenta que ya existe.
+
 ### Variables de entorno
 
 | Variable | Para qué sirve |
@@ -86,6 +97,7 @@ gimnasio/
 ├── db.py                 # Base SQLite: esquema y transacciones
 ├── arranque.py           # Preparación al iniciar y tarea de respaldos
 ├── restaurar.py          # Restaurar una copia: python -m gimnasio.restaurar
+├── cambiar_clave.py      # Recuperar una contraseña olvidada: python -m gimnasio.cambiar_clave USUARIO
 ├── datos/                # Acceso a los datos (sin NiceGUI)
 │   ├── usuarios.py       #   cuentas del personal
 │   ├── clientes.py       #   fichas y contraseñas de clientes

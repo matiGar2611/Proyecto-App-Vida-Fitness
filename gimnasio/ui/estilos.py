@@ -231,12 +231,14 @@ body {
 @media (max-width: 700px) {
     .p-8 { padding: 14px !important; }
     .page-title { font-size: 25px; }
-    .app-header { padding-left: 10px !important; padding-right: 10px !important; }
-    .app-header .row { flex-wrap: nowrap; overflow-x: auto; }
+    .app-header { height: auto !important; min-height: 64px; padding: 6px 10px !important; }
+    .app-header .q-separator--vertical { display: none; }
     .logo-text { display: none; }
-    .nav-button .block { display: none; }
-    .nav-button { min-width: 44px; }
     .user-info-name, .user-info-role { display: none; }
+    /* Los enlaces del personal pasan a una segunda fila que se desliza con el dedo */
+    .nav-links-staff { order: 10; flex: 0 0 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
+    .nav-links-staff .nav-button { flex-shrink: 0; min-width: auto; padding: 0 10px; font-size: 13px; }
+    .nav-links-staff .nav-button .q-icon { font-size: 18px; }
     .mi-cuenta-card { padding: 18px; }
     .login-card { padding: 26px 20px; }
     .grid-stats { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }

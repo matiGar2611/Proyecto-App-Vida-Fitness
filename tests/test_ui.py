@@ -142,6 +142,21 @@ class TestEstructura(BaseUi):
         self.abrir('/usuarios')
         self.assertEqual(stub.NAVEGACIONES, ['/login'])
 
+    def test_los_enlaces_del_personal_van_en_un_contenedor_que_en_el_celular_pasa_a_otra_fila(self):
+        from gimnasio.ui.estilos import CSS
+        self.entrar_como('dueno1')
+        self.pantalla_nueva()
+        navbar.construir_navbar()
+        self.assertTrue(any('nav-links-staff' in ' '.join(e.clases) for e in self.tipo('row')))
+        self.entrar_como_cliente()
+        self.pantalla_nueva()
+        navbar.construir_navbar()
+        self.assertFalse(any('nav-links-staff' in ' '.join(e.clases) for e in self.tipo('row')))
+        # el CSS no vuelve a esconder ni a achicar los nombres de los botones
+        self.assertIn('.nav-links-staff', CSS)
+        self.assertNotIn('.nav-button .block { display: none; }', CSS)
+        self.assertEqual(CSS.count('{'), CSS.count('}'))
+
     def test_botones_de_la_barra_segun_el_rol(self):
         def botones():
             self.pantalla_nueva()

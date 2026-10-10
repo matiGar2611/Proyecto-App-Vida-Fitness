@@ -68,36 +68,38 @@ def construir_navbar():
 
             ui.space()
 
-            if es_cliente_rol():
-                ui.button('Mi cuenta', icon='person', on_click=lambda: ui.navigate.to('/mi-cuenta')) \
-                    .props('flat').classes('nav-button')
-            else:
-                ui.button('Clientes', icon='groups', on_click=lambda: ui.navigate.to('/')) \
-                    .props('flat').classes('nav-button')
-                if es_dueño():
-                    ui.button('Usuarios', icon='manage_accounts',
-                              on_click=lambda: ui.navigate.to('/usuarios')) \
+            # Los enlaces van juntos: en el celular el CSS los pasa a una segunda fila que se desliza.
+            with ui.row().classes('nav-links items-center no-wrap' + ('' if es_cliente_rol() else ' nav-links-staff')):
+                if es_cliente_rol():
+                    ui.button('Mi cuenta', icon='person', on_click=lambda: ui.navigate.to('/mi-cuenta')) \
                         .props('flat').classes('nav-button')
-                    ui.button('Contabilidad', icon='account_balance',
-                              on_click=lambda: ui.navigate.to('/contabilidad')) \
+                else:
+                    ui.button('Clientes', icon='groups', on_click=lambda: ui.navigate.to('/')) \
                         .props('flat').classes('nav-button')
-                    ui.button('Precios', icon='sell',
-                              on_click=lambda: ui.navigate.to('/precios')) \
-                        .props('flat').classes('nav-button')
-                    ui.button('Información', icon='info',
-                              on_click=lambda: ui.navigate.to('/informacion')) \
-                        .props('flat').classes('nav-button')
-                    ui.button('Anuncios', icon='campaign',
-                              on_click=lambda: ui.navigate.to('/anuncios')) \
-                        .props('flat').classes('nav-button')
-                    ui.button('Respaldos', icon='backup',
-                              on_click=lambda: ui.navigate.to('/respaldos')) \
-                        .props('flat').classes('nav-button')
-                    ui.button('Actividad', icon='history',
-                              on_click=lambda: ui.navigate.to('/actividad')) \
-                        .props('flat').classes('nav-button')
-                ui.button(icon='lock', on_click=abrir_dialogo_cambiar_mi_password) \
-                    .props('flat round').classes('nav-button').tooltip('Cambiar mi contraseña')
+                    if es_dueño():
+                        ui.button('Usuarios', icon='manage_accounts',
+                                  on_click=lambda: ui.navigate.to('/usuarios')) \
+                            .props('flat').classes('nav-button')
+                        ui.button('Contabilidad', icon='account_balance',
+                                  on_click=lambda: ui.navigate.to('/contabilidad')) \
+                            .props('flat').classes('nav-button')
+                        ui.button('Precios', icon='sell',
+                                  on_click=lambda: ui.navigate.to('/precios')) \
+                            .props('flat').classes('nav-button')
+                        ui.button('Información', icon='info',
+                                  on_click=lambda: ui.navigate.to('/informacion')) \
+                            .props('flat').classes('nav-button')
+                        ui.button('Anuncios', icon='campaign',
+                                  on_click=lambda: ui.navigate.to('/anuncios')) \
+                            .props('flat').classes('nav-button')
+                        ui.button('Respaldos', icon='backup',
+                                  on_click=lambda: ui.navigate.to('/respaldos')) \
+                            .props('flat').classes('nav-button')
+                        ui.button('Actividad', icon='history',
+                                  on_click=lambda: ui.navigate.to('/actividad')) \
+                            .props('flat').classes('nav-button')
+                    ui.button(icon='lock', on_click=abrir_dialogo_cambiar_mi_password) \
+                        .props('flat round').classes('nav-button').tooltip('Cambiar mi contraseña')
 
             ui.separator().props('vertical').classes('mx-2').style('height: 28px;')
 
